@@ -1,0 +1,10 @@
+# Goal
+geometry_msgs/PoseStamped target_pose
+float64 width
+---
+# Result
+bool success
+string message
+---
+# Feedback
+string stage

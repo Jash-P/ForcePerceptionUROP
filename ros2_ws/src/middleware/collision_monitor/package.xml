@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>collision_monitor</name>
+  <version>0.1.0</version>
+  <description>Runtime collision and effort monitor for UR5 + AR10</description>
+  <maintainer email="you@example.com">Your Name</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- Build tool -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <!-- Dependencies -->
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <!-- For message generation -->
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

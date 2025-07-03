@@ -1,0 +1,8 @@
+# Request
+sensor_msgs/JointState start
+sensor_msgs/JointState goal
+float64      time_allowed
+---
+# Response
+trajectory_msgs/JointTrajectory trajectory
+bool                     success
