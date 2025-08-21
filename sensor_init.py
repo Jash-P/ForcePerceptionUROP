@@ -2,8 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 UR5 EIT localizer: range-based discretization + random subset selection
-Adds "rise → reposition at hover → lower" between every pose.
-Adds Way B: software Z-floor guard (MIN_BASE_Z).
+- Rise → hover → lower at each pose
+- Way B: software Z-floor guard (applies to the controlled tool-point)
+- NEW: Z targets now refer to a specific tool-point (x=0 on line TCP→head)
+
 Requires: ur_rtde, pyserial
 """
 
@@ -20,9 +22,9 @@ from rtde_receive import RTDEReceiveInterface as RTDEReceive
 
 # ---------------------------- USER SETTINGS ---------------------------- #
 
-ROBOT_IP = "169.254.150.50"   # your UR5 IP
+ROBOT_IP = "169.254.150.50"
 
-# TCP offset to the *sensor center* (meters, axis-angle radians)
+# Active TCP set to the *sensor center* (meters, axis-angle radians)
 TCP_OFFSET_AT_SENSOR_CENTER = [-0.020, 0.000, 0.100, 0.0, 0.0, 0.0]
 
 # Motion & dwell
@@ -30,12 +32,17 @@ SPEED = 0.10          # m/s
 ACCEL = 0.10          # m/s^2
 DWELL = 1.30          # s to settle & read EIT per pose
 
-# Hover / retract height (base Z)
+# Hover / retract height (applied to the controlled tool-point Z)
 HOVER_LIFT_Z = 0.100  # 100 mm
 
-# ---------- Way B: software floor (base-frame Z) ----------
-MIN_BASE_Z = -0.390    # <-- set this to your safe floor height (meters)
-CLAMP_BELOW_FLOOR = False  # True: clamp Z to floor instead of aborting
+# ---------- Controlled tool-point (in TCP/tool frame) ----------
+# Choose the point along the TCP→head line **with x=0** that should hit the Z setpoint.
+# Example: 50 mm below TCP along tool -Z, centered in x and y.
+TOUCH_POINT_TOOL = [0.0, 0.0, -0.050]  # [x=0, y_p, z_p]  <-- MEASURE & SET FOR YOUR TOOL
+
+# ---------- Way B: software floor (applies to the controlled tool-point) ----------
+MIN_BASE_Z = -0.390          # meters (base frame)
+CLAMP_BELOW_FLOOR = False    # True: clamp the point-Z to floor instead of aborting
 
 # Logging
 LOG_CSV_PATH = "eit_localisation_log.csv"
@@ -44,8 +51,8 @@ LOG_WRENCH   = True
 # EIT serial
 EIT_PORT = "COM5"
 EIT_BAUD = 115200
-EIT_TIMEOUT = 0.2     # seconds for .readline()
-EIT_SNIFF_SECS = 2.0  # try to grab one line at start to size columns
+EIT_TIMEOUT = 0.2
+EIT_SNIFF_SECS = 2.0
 
 # Anchor pose
 USE_CURRENT_POSE_AS_START = True
@@ -55,27 +62,26 @@ EXPLICIT_START_POSE = [0.40, -0.20, 0.20, 3.1415, 0.0, 0.0]
 # Distances in meters; angles in degrees. Increments are constant.
 X_MIN, X_MAX, X_STEP = -0.030, +0.030, 0.005
 Y_MIN, Y_MAX, Y_STEP = -0.030, +0.030, 0.005
-Z_MIN, Z_MAX, Z_STEP =  0.000, +0.010, 0.001
-
+Z_MIN, Z_MAX, Z_STEP =  0.000, +0.005, 0.001     # <-- now interpreted as the *tool-point* Z offsets
 ROLL_MIN,  ROLL_MAX,  ROLL_STEP  = -10, +10, 1
 PITCH_MIN, PITCH_MAX, PITCH_STEP = -10, +10, 1
 YAW_MIN,   YAW_MAX,   YAW_STEP   = -20, +20, 1
 
 # Selection: do ALL poses or RANDOM sample of N
 SELECTION_MODE   = "RANDOM"   # "ALL" or "RANDOM"
-RANDOM_SAMPLE_N  = 50         # used only if SELECTION_MODE == "RANDOM"
-RANDOM_SEED      = 42         # for reproducibility
+RANDOM_SAMPLE_N  = 5
+RANDOM_SEED      = 42
 
 # ---------------------------------------------------------------------- #
-# ---------- math helpers: rotations & pose composition (axis-angle) --- #
+# ------------------------ math / pose utilities ----------------------- #
 
 def rvec_to_rotmat(rvec):
     rx, ry, rz = rvec
-    theta = math.sqrt(rx*rx + ry*ry + rz*rz)
-    if theta < 1e-12:
-        return [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]]
-    ux, uy, uz = rx/theta, ry/theta, rz/theta
-    c = math.cos(theta); s = math.sin(theta); C = 1.0 - c
+    th = math.sqrt(rx*rx + ry*ry + rz*rz)
+    if th < 1e-12:
+        return [[1,0,0],[0,1,0],[0,0,1]]
+    ux, uy, uz = rx/th, ry/th, rz/th
+    c = math.cos(th); s = math.sin(th); C = 1.0 - c
     return [
         [c+ux*ux*C,      ux*uy*C - uz*s, ux*uz*C + uy*s],
         [uy*ux*C + uz*s, c+uy*uy*C,      uy*uz*C - ux*s],
@@ -84,57 +90,46 @@ def rvec_to_rotmat(rvec):
 
 def rotmat_to_rvec(R):
     tr = R[0][0] + R[1][1] + R[2][2]
-    cos_theta = max(min((tr - 1.0)/2.0, 1.0), -1.0)
-    theta = math.acos(cos_theta)
-    if theta < 1e-12:
+    ct = max(min((tr - 1.0)/2.0, 1.0), -1.0)
+    th = math.acos(ct)
+    if th < 1e-12:
         return [0.0, 0.0, 0.0]
-    denom = 2.0*math.sin(theta)
-    rx = (R[2][1] - R[1][2]) / denom
-    ry = (R[0][2] - R[2][0]) / denom
-    rz = (R[1][0] - R[0][1]) / denom
-    return [rx*theta, ry*theta, rz*theta]
+    denom = 2.0*math.sin(th)
+    rx = (R[2][1]-R[1][2]) / denom
+    ry = (R[0][2]-R[2][0]) / denom
+    rz = (R[1][0]-R[0][1]) / denom
+    return [rx*th, ry*th, rz*th]
 
 def rpy_to_rotmat(roll, pitch, yaw, order="XYZ"):
     cx, sx = math.cos(roll),  math.sin(roll)
     cy, sy = math.cos(pitch), math.sin(pitch)
     cz, sz = math.cos(yaw),   math.sin(yaw)
-
     Rx = [[1,0,0],[0,cx,-sx],[0,sx,cx]]
     Ry = [[cy,0,sy],[0,1,0],[-sy,0,cy]]
     Rz = [[cz,-sz,0],[sz,cz,0],[0,0,1]]
 
     def mm(A,B):
-        return [
-            [A[0][0]*B[0][0]+A[0][1]*B[1][0]+A[0][2]*B[2][0],
-             A[0][0]*B[0][1]+A[0][1]*B[1][1]+A[0][2]*B[2][1],
-             A[0][0]*B[0][2]+A[0][1]*B[1][2]+A[0][2]*B[2][2]],
-            [A[1][0]*B[0][0]+A[1][1]*B[1][0]+A[1][2]*B[2][0],
-             A[1][0]*B[0][1]+A[1][1]*B[1][1]+A[1][2]*B[2][1],
-             A[1][0]*B[0][2]+A[1][1]*B[1][2]+A[1][2]*B[2][2]],
-            [A[2][0]*B[0][0]+A[2][1]*B[1][0]+A[2][2]*B[2][0],
-             A[2][0]*B[0][1]+A[2][1]*B[1][1]+A[2][2]*B[2][1],
-             A[2][0]*B[0][2]+A[2][1]*B[1][2]+A[2][2]*B[2][2]]
-        ]
-    if order.upper() == "XYZ":
-        return mm(mm(Rx, Ry), Rz)
-    elif order.upper() == "ZYX":
-        return mm(mm(Rz, Ry), Rx)
-    else:
-        raise ValueError("Unsupported RPY order")
+        return [[A[0][0]*B[0][0]+A[0][1]*B[1][0]+A[0][2]*B[2][0],
+                 A[0][0]*B[0][1]+A[0][1]*B[1][1]+A[0][2]*B[2][1],
+                 A[0][0]*B[0][2]+A[0][1]*B[1][2]+A[0][2]*B[2][2]],
+                [A[1][0]*B[0][0]+A[1][1]*B[1][0]+A[1][2]*B[2][0],
+                 A[1][0]*B[0][1]+A[1][1]*B[1][1]+A[1][2]*B[2][1],
+                 A[1][0]*B[0][2]+A[1][1]*B[1][2]+A[1][2]*B[2][2]],
+                [A[2][0]*B[0][0]+A[2][1]*B[1][0]+A[2][2]*B[2][0],
+                 A[2][0]*B[0][1]+A[2][1]*B[1][1]+A[2][2]*B[2][1],
+                 A[2][0]*B[0][2]+A[2][1]*B[1][2]+A[2][2]*B[2][2]]]
+    return mm(mm(Rx,Ry),Rz) if order.upper()=="XYZ" else mm(mm(Rz,Ry),Rx)
 
 def rpy_to_rvec(roll, pitch, yaw, order="XYZ"):
-    R = rpy_to_rotmat(roll, pitch, yaw, order=order)
-    return rotmat_to_rvec(R)
+    return rotmat_to_rvec(rpy_to_rotmat(roll, pitch, yaw, order=order))
 
-def pose_to_tf(pose):
-    x,y,z, rx,ry,rz = pose
+def pose_to_tf(p):
+    x,y,z, rx,ry,rz = p
     R = rvec_to_rotmat([rx,ry,rz])
-    return [
-        [R[0][0], R[0][1], R[0][2], x],
-        [R[1][0], R[1][1], R[1][2], y],
-        [R[2][0], R[2][1], R[2][2], z],
-        [0,0,0,1]
-    ]
+    return [[R[0][0],R[0][1],R[0][2],x],
+            [R[1][0],R[1][1],R[1][2],y],
+            [R[2][0],R[2][1],R[2][2],z],
+            [0,0,0,1]]
 
 def tf_to_pose(T):
     x,y,z = T[0][3], T[1][3], T[2][3]
@@ -145,44 +140,36 @@ def tf_to_pose(T):
     return [x,y,z, rx,ry,rz]
 
 def tf_mul(A,B):
-    out = [[0.0]*4 for _ in range(4)]
-    for i in range(4):
-        for j in range(4):
-            out[i][j] = sum(A[i][k]*B[k][j] for k in range(4))
-    return out
+    return [[sum(A[i][k]*B[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
 
-def compose_pose(base_pose, delta_pose_toolframe):
-    T_base  = pose_to_tf(base_pose)
-    T_delta = pose_to_tf(delta_pose_toolframe)
-    T_new   = tf_mul(T_base, T_delta)
-    return tf_to_pose(T_new)
+def compose_pose(base_pose, delta_tool):
+    return tf_to_pose(tf_mul(pose_to_tf(base_pose), pose_to_tf(delta_tool)))
 
 def deg2rad(d): return d * math.pi / 180.0
 
-# ---------- Way B helpers: software floor ---------- #
-def floor_guard(pose):
-    """Return a pose that is safe wrt MIN_BASE_Z.
-    - If CLAMP_BELOW_FLOOR is False: raise ValueError if below floor.
-    - If True: clamp Z to MIN_BASE_Z and return adjusted pose.
-    """
-    if pose[2] >= MIN_BASE_Z - 1e-9:
-        return pose
-    if CLAMP_BELOW_FLOOR:
-        p = list(pose)
-        p[2] = MIN_BASE_Z
-        print(f"[FLOOR] Clamped Z from {pose[2]:.3f} to {MIN_BASE_Z:.3f}")
-        return p
-    raise ValueError(f"Target Z={pose[2]:.3f} m is below floor ({MIN_BASE_Z:.3f} m).")
+# ---- tool-point control: convert desired point-Z -> required TCP-Z ---- #
 
-def safe_moveL(rtde_c, rtde_r, target, speed, accel):
-    """Move with floor check. Returns False if rejected or move fails."""
-    try:
-        tgt = floor_guard(target)
-    except ValueError as e:
-        print(f"[FLOOR ABORT] {e}")
-        return False
-    ok = rtde_c.moveL(tgt, speed, accel)
-    return bool(ok)
+def world_point_z_for_tcp_pose(tcp_pose, point_tool):
+    """World Z of a tool-fixed point given a TCP pose."""
+    rx,ry,rz = tcp_pose[3], tcp_pose[4], tcp_pose[5]
+    R = rvec_to_rotmat([rx,ry,rz])
+    px,py,pz = point_tool
+    # world offset z from TCP to point
+    dz = R[2][0]*px + R[2][1]*py + R[2][2]*pz
+    return tcp_pose[2] + dz
+
+def tcp_pose_for_desired_point_z(pose_like_tcp, point_tool):
+    """Given (x,y,desired_point_z, rx,ry,rz), compute TCP z so that the tool-point hits desired_point_z."""
+    x,y,desired_point_z, rx,ry,rz = pose_like_tcp
+    R = rvec_to_rotmat([rx,ry,rz])
+    px,py,pz = point_tool
+    dz = R[2][0]*px + R[2][1]*py + R[2][2]*pz  # world z offset of point from TCP
+    tcp_z = desired_point_z - dz
+    return [x,y,tcp_z, rx,ry,rz]
+
+def add_z(pose, dz):
+    """Add dz to the Z (used for point-Z poses & also TCP poses where appropriate)."""
+    return [pose[0], pose[1], pose[2] + dz, pose[3], pose[4], pose[5]]
 
 # ---------- EIT serial helpers ---------- #
 
@@ -199,10 +186,7 @@ def read_eit_line(ser, timeout_s):
         line = ser.readline()
         if not line:
             continue
-        try:
-            s = line.decode("utf-8", errors="ignore").strip()
-        except Exception:
-            s = ""
+        s = line.decode("utf-8", errors="ignore").strip()
         if s:
             last = s
             break
@@ -221,7 +205,7 @@ def open_csv_logger(path, include_wrench=True, eit_cols=None):
     fields = [
         "timestamp","session_id","index",
         "dx_m","dy_m","dz_m","roll_deg","pitch_deg","yaw_deg",
-        "sensor_x","sensor_y","sensor_z","sensor_rx","sensor_ry","sensor_rz",
+        "point_set_z",  # desired Z of controlled tool-point
         "cmd_tcp_x","cmd_tcp_y","cmd_tcp_z","cmd_tcp_rx","cmd_tcp_ry","cmd_tcp_rz",
         "act_tcp_x","act_tcp_y","act_tcp_z","act_tcp_rx","act_tcp_ry","act_tcp_rz",
         "eit_raw"
@@ -242,8 +226,7 @@ def open_csv_logger(path, include_wrench=True, eit_cols=None):
 def frange_fixed_step(vmin, vmax, step):
     if step <= 0:
         raise ValueError("step must be > 0")
-    vals = []
-    x = vmin
+    vals, x = [], vmin
     while x <= vmax + 1e-12:
         vals.append(round(x, 9))
         x += step
@@ -258,10 +241,23 @@ def build_ranges():
     Yaw = frange_fixed_step(YAW_MIN,  YAW_MAX,  YAW_STEP)
     return X, Y, Z, R, P, Yaw
 
-# ---------- Hover helpers ---------- #
-def add_z(pose, dz):
-    """Return pose with z shifted by dz (keep x,y,rx,ry,rz)."""
-    return [pose[0], pose[1], pose[2] + dz, pose[3], pose[4], pose[5]]
+# ---------- point-floor guard (applies to desired point-Z) ---------- #
+def enforce_point_floor_z(desired_point_z):
+    if desired_point_z >= MIN_BASE_Z - 1e-9:
+        return desired_point_z
+    if CLAMP_BELOW_FLOOR:
+        print(f"[POINT-FLOOR] Clamped point-Z from {desired_point_z:.3f} to {MIN_BASE_Z:.3f}")
+        return MIN_BASE_Z
+    raise ValueError(f"Desired point-Z {desired_point_z:.3f} < floor {MIN_BASE_Z:.3f}")
+
+def safe_move_pointZ(rtde_c, pose_pointZ, speed, accel):
+    """pose_pointZ = [x,y, desired_point_z, rx,ry,rz]; converts to TCP pose and moveL."""
+    # floor check on the *point*
+    z_ok = enforce_point_floor_z(pose_pointZ[2])
+    pose_pointZ = [pose_pointZ[0], pose_pointZ[1], z_ok, pose_pointZ[3], pose_pointZ[4], pose_pointZ[5]]
+    # convert to TCP pose so that the tool-point hits the desired Z
+    tcp_pose = tcp_pose_for_desired_point_z(pose_pointZ, TOUCH_POINT_TOOL)
+    return bool(rtde_c.moveL(tcp_pose, speed, accel)), tcp_pose
 
 # ---------------------------- main routine ---------------------------- #
 
@@ -281,26 +277,26 @@ def main():
 
     try:
         # 1) Set TCP to the sensor center
-        # NOTE: If this triggers a protective stop on your setup, comment it out.
         rtde_c.setTcp(TCP_OFFSET_AT_SENSOR_CENTER)
 
-        # 2) Anchor pose
-        start_pose = rtde_r.getActualTCPPose() if USE_CURRENT_POSE_AS_START else EXPLICIT_START_POSE
-        start_hover = add_z(start_pose, HOVER_LIFT_Z)
-        print("Start anchor pose:", [round(v,6) for v in start_pose])
-        print("Start hover pose :", [round(v,6) for v in start_hover])
+        # 2) Anchor pose (TCP pose)
+        start_tcp = rtde_r.getActualTCPPose() if USE_CURRENT_POSE_AS_START else EXPLICIT_START_POSE
+        print("Start TCP pose:", [round(v,6) for v in start_tcp])
 
-        # Move to hover before starting the sequence (with floor guard)
-        if not safe_moveL(rtde_c, rtde_r, start_hover, SPEED, ACCEL):
-            print("Cannot reach start hover (floor guard). Exiting.")
+        # Compute current controlled point's Z and rise to hover (point-Z)
+        current_point_z = world_point_z_for_tcp_pose(start_tcp, TOUCH_POINT_TOOL)
+        start_point_hover = [start_tcp[0], start_tcp[1], current_point_z + HOVER_LIFT_Z,
+                             start_tcp[3], start_tcp[4], start_tcp[5]]
+        ok, _ = safe_move_pointZ(rtde_c, start_point_hover, SPEED, ACCEL)
+        if not ok:
+            print("Cannot reach start hover (point-floor). Exiting.")
             return
 
         # 3) Build discretized ranges
-        X_OFFSETS, Y_OFFSETS, Z_OFFSETS, ROLL_DEG_LIST, PITCH_DEG_LIST, YAW_DEG_LIST = build_ranges()
+        Xs, Ys, Zs, Rls, Pcs, Yws = build_ranges()
 
-        # 4) Build full grid then select subset
-        full_grid = [(dx,dy,dz,r,p,y) for dx,dy,dz,r,p,y in
-                     product(X_OFFSETS, Y_OFFSETS, Z_OFFSETS, ROLL_DEG_LIST, PITCH_DEG_LIST, YAW_DEG_LIST)]
+        # 4) Build full grid then select subset (dx,dy,dz are tool-frame deltas; dz maps to point-Z)
+        full_grid = [(dx,dy,dz,r,p,y) for dx,dy,dz,r,p,y in product(Xs, Ys, Zs, Rls, Pcs, Yws)]
         total = len(full_grid)
         print(f"Total grid size: {total}")
 
@@ -308,7 +304,7 @@ def main():
             selected = full_grid
         else:
             k = min(RANDOM_SAMPLE_N, total)
-            rng = random.Random(RANDOM_SEED)  # independent RNG
+            rng = random.Random(RANDOM_SEED)
             selected = rng.sample(full_grid, k)
             print(f"Randomly selected {k} poses (seed={RANDOM_SEED}).")
 
@@ -320,33 +316,39 @@ def main():
         def rpy_combo_to_rvec(roll_deg, pitch_deg, yaw_deg, order="XYZ"):
             return rpy_to_rvec(deg2rad(roll_deg), deg2rad(pitch_deg), deg2rad(yaw_deg), order=order)
 
-        # 5) Iterate selected poses with rise → reposition at hover → lower
+        # 5) Iterate poses (rise→hover, orient/XY at hover, lower until *point* hits desired Z)
         for idx, (dx, dy, dz, rdeg, pdeg, ydeg) in enumerate(selected, start=1):
+            # Build a base pose by applying tool-frame deltas to the *start TCP pose* (xy/orientation),
+            # but remember: the z we supply below is for the controlled tool-point.
             drx, dry, drz = rpy_combo_to_rvec(rdeg, pdeg, ydeg, order="XYZ")
-            delta_tool   = [dx, dy, dz, drx, dry, drz]        # tool-frame delta
-            target       = compose_pose(start_pose, delta_tool)
-            target_hover = add_z(target, HOVER_LIFT_Z)        # same x,y,rx,ry,rz, but z + 100mm
+            delta_tool = [dx, dy, 0.0, drx, dry, drz]               # z handled as point-Z separately
+            base_tcp   = compose_pose(start_tcp, delta_tool)        # x,y,orientation for this sample
 
-            print(f"[{idx}/{len(selected)}] target      : {[round(v,6) for v in target]}")
-            print(f"                  target_hover: {[round(v,6) for v in target_hover]}")
+            # Desired point-Z at target and hover:
+            # Take the *start* controlled point-Z as reference, then add desired dz.
+            start_point_z = world_point_z_for_tcp_pose(start_tcp, TOUCH_POINT_TOOL)
+            target_pointZ = [base_tcp[0], base_tcp[1], start_point_z + dz,
+                             base_tcp[3], base_tcp[4], base_tcp[5]]
+            hover_pointZ  = add_z(target_pointZ, HOVER_LIFT_Z)
 
-            # 1) Reposition at hover height
-            if not safe_moveL(rtde_c, rtde_r, target_hover, SPEED, ACCEL):
-                print("moveL() to target_hover rejected/failed — stopping.")
+            print(f"[{idx}/{len(selected)}] pointZ target z={target_pointZ[2]:.3f}  rpy=({rdeg},{pdeg},{ydeg})")
+
+            # 1) Reposition at hover (XY + orientation at safe height)
+            ok, tcp_hover = safe_move_pointZ(rtde_c, hover_pointZ, SPEED, ACCEL)
+            if not ok:
+                print("moveL() to hover (point-Z) rejected/failed — stopping.")
                 break
 
-            # 2) Lower straight down to target Z
-            if not safe_moveL(rtde_c, rtde_r, target, SPEED, ACCEL):
-                print("moveL() to target rejected/failed — stopping.")
+            # 2) Lower so the controlled tool-point hits its desired Z
+            ok, tcp_tgt = safe_move_pointZ(rtde_c, target_pointZ, SPEED, ACCEL)
+            if not ok:
+                print("moveL() to target (point-Z) rejected/failed — stopping.")
                 break
 
-            # Dwell & read EIT
+            # ---- Dwell & EIT read ----
             if ser:
-                try:
-                    ser.reset_input_buffer()
-                except Exception:
-                    pass
-
+                try: ser.reset_input_buffer()
+                except Exception: pass
             t_end = time.time() + DWELL
             last_raw = ""
             while time.time() < t_end:
@@ -354,10 +356,8 @@ def main():
                     last_raw = read_eit_line(ser, timeout_s=EIT_TIMEOUT) or last_raw
                 time.sleep(0.01)
 
-            # Log row
-            sensor_target_pose = target  # TCP is set to sensor center, so same
-            cmd_tcp_pose       = target
-            actual_tcp_pose    = rtde_r.getActualTCPPose()
+            # ---- Log ----
+            actual_tcp = rtde_r.getActualTCPPose()
             wrench = rtde_r.getActualTCPForce() if LOG_WRENCH else [None]*6
 
             row = {
@@ -366,15 +366,13 @@ def main():
                 "index": idx,
                 "dx_m": float(dx), "dy_m": float(dy), "dz_m": float(dz),
                 "roll_deg": float(rdeg), "pitch_deg": float(pdeg), "yaw_deg": float(ydeg),
-                "sensor_x": sensor_target_pose[0], "sensor_y": sensor_target_pose[1], "sensor_z": sensor_target_pose[2],
-                "sensor_rx": sensor_target_pose[3], "sensor_ry": sensor_target_pose[4], "sensor_rz": sensor_target_pose[5],
-                "cmd_tcp_x": cmd_tcp_pose[0], "cmd_tcp_y": cmd_tcp_pose[1], "cmd_tcp_z": cmd_tcp_pose[2],
-                "cmd_tcp_rx": cmd_tcp_pose[3], "cmd_tcp_ry": cmd_tcp_pose[4], "cmd_tcp_rz": cmd_tcp_pose[5],
-                "act_tcp_x": actual_tcp_pose[0], "act_tcp_y": actual_tcp_pose[1], "act_tcp_z": actual_tcp_pose[2],
-                "act_tcp_rx": actual_tcp_pose[3], "act_tcp_ry": actual_tcp_pose[4], "act_tcp_rz": actual_tcp_pose[5],
+                "point_set_z": target_pointZ[2],
+                "cmd_tcp_x": tcp_tgt[0], "cmd_tcp_y": tcp_tgt[1], "cmd_tcp_z": tcp_tgt[2],
+                "cmd_tcp_rx": tcp_tgt[3], "cmd_tcp_ry": tcp_tgt[4], "cmd_tcp_rz": tcp_tgt[5],
+                "act_tcp_x": actual_tcp[0], "act_tcp_y": actual_tcp[1], "act_tcp_z": actual_tcp[2],
+                "act_tcp_rx": actual_tcp[3], "act_tcp_ry": actual_tcp[4], "act_tcp_rz": actual_tcp[5],
                 "eit_raw": last_raw
             }
-
             if eit_cols and last_raw:
                 parts = [p.strip() for p in last_raw.split(",")]
                 for i, name in enumerate(eit_cols):
@@ -384,34 +382,31 @@ def main():
                 Fx,Fy,Fz,Tx,Ty,Tz = wrench
                 row.update({"Fx":Fx,"Fy":Fy,"Fz":Fz,"Tx":Tx,"Ty":Ty,"Tz":Tz})
 
-            csv_w.writerow(row)
-            csv_f.flush()
+            csv_w.writerow(row); csv_f.flush()
 
-            # 3) Rise back up to hover ready for the next pose
-            if not safe_moveL(rtde_c, rtde_r, target_hover, SPEED, ACCEL):
-                print("moveL() back to hover rejected/failed — stopping.")
+            # 3) Rise back to hover (point-Z)
+            ok, _ = safe_move_pointZ(rtde_c, hover_pointZ, SPEED, ACCEL)
+            if not ok:
+                print("moveL() back to hover (point-Z) rejected/failed — stopping.")
                 break
 
-        # Return to anchor (hover, then lower)
-        print("Returning to anchor pose.")
-        if not safe_moveL(rtde_c, rtde_r, add_z(start_pose, HOVER_LIFT_Z), SPEED, ACCEL):
-            print("Could not move to start hover (floor guard).")
-        safe_moveL(rtde_c, rtde_r, start_pose, SPEED, ACCEL)
+        # Return near start (rise then back toward start TCP at current height)
+        print("Returning to start hover.")
+        # keep current orientation/XY, lift the *point* by HOVER_LIFT_Z and then go near start
+        current_tcp = rtde_r.getActualTCPPose()
+        current_point_z = world_point_z_for_tcp_pose(current_tcp, TOUCH_POINT_TOOL)
+        back_hover = [current_tcp[0], current_tcp[1], current_point_z + HOVER_LIFT_Z,
+                      current_tcp[3], current_tcp[4], current_tcp[5]]
+        safe_move_pointZ(rtde_c, back_hover, SPEED, ACCEL)
 
     finally:
+        try: rtde_c.stopScript()
+        except Exception: pass
+        try: csv_f.close()
+        except Exception: pass
         try:
-            rtde_c.stopScript()
-        except Exception:
-            pass
-        try:
-            csv_f.close()
-        except Exception:
-            pass
-        try:
-            if ser:
-                ser.close()
-        except Exception:
-            pass
+            if ser: ser.close()
+        except Exception: pass
         print("Done.")
 
 if __name__ == "__main__":
