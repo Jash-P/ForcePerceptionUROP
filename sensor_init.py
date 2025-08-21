@@ -2,10 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 UR5 EIT localizer: range-based discretization + random subset selection
-- Uses min/max + fixed increments for x/y/z + roll/pitch/yaw
-- Optionally samples N random poses from the full grid
-- Logs EIT CSV from COM5 into the output CSV, plus robot data
-
+Adds "rise → reposition at hover → lower" between every pose.
+Adds Way B: software Z-floor guard (MIN_BASE_Z).
 Requires: ur_rtde, pyserial
 """
 
@@ -32,6 +30,13 @@ SPEED = 0.10          # m/s
 ACCEL = 0.10          # m/s^2
 DWELL = 1.30          # s to settle & read EIT per pose
 
+# Hover / retract height (base Z)
+HOVER_LIFT_Z = 0.100  # 100 mm
+
+# ---------- Way B: software floor (base-frame Z) ----------
+MIN_BASE_Z = -0.390    # <-- set this to your safe floor height (meters)
+CLAMP_BELOW_FLOOR = False  # True: clamp Z to floor instead of aborting
+
 # Logging
 LOG_CSV_PATH = "eit_localisation_log.csv"
 LOG_WRENCH   = True
@@ -48,17 +53,17 @@ EXPLICIT_START_POSE = [0.40, -0.20, 0.20, 3.1415, 0.0, 0.0]
 
 # -------- RANGE MODE (min/max with fixed increments) --------
 # Distances in meters; angles in degrees. Increments are constant.
-X_MIN, X_MAX, X_STEP = -0.030, +0.030, 0.005    # ±30 mm in 5 mm steps (=> -10, 0, +10 mm)
+X_MIN, X_MAX, X_STEP = -0.030, +0.030, 0.005
 Y_MIN, Y_MAX, Y_STEP = -0.030, +0.030, 0.005
-Z_MIN, Z_MAX, Z_STEP =  0.000, +0.010, 0.001    # 0 - 10 mm in 1mm steps
+Z_MIN, Z_MAX, Z_STEP =  0.000, +0.010, 0.001
 
-ROLL_MIN,  ROLL_MAX,  ROLL_STEP  = -10, +10, 1  # ±10 deg in 1 deg steps
+ROLL_MIN,  ROLL_MAX,  ROLL_STEP  = -10, +10, 1
 PITCH_MIN, PITCH_MAX, PITCH_STEP = -10, +10, 1
-YAW_MIN,   YAW_MAX,   YAW_STEP   = -20, +20, 1 # ±20 deg in 1 deg steps
+YAW_MIN,   YAW_MAX,   YAW_STEP   = -20, +20, 1
 
 # Selection: do ALL poses or RANDOM sample of N
 SELECTION_MODE   = "RANDOM"   # "ALL" or "RANDOM"
-RANDOM_SAMPLE_N  = 20         # used only if SELECTION_MODE == "RANDOM"
+RANDOM_SAMPLE_N  = 50         # used only if SELECTION_MODE == "RANDOM"
 RANDOM_SEED      = 42         # for reproducibility
 
 # ---------------------------------------------------------------------- #
@@ -93,6 +98,7 @@ def rpy_to_rotmat(roll, pitch, yaw, order="XYZ"):
     cx, sx = math.cos(roll),  math.sin(roll)
     cy, sy = math.cos(pitch), math.sin(pitch)
     cz, sz = math.cos(yaw),   math.sin(yaw)
+
     Rx = [[1,0,0],[0,cx,-sx],[0,sx,cx]]
     Ry = [[cy,0,sy],[0,1,0],[-sy,0,cy]]
     Rz = [[cz,-sz,0],[sz,cz,0],[0,0,1]]
@@ -153,6 +159,31 @@ def compose_pose(base_pose, delta_pose_toolframe):
 
 def deg2rad(d): return d * math.pi / 180.0
 
+# ---------- Way B helpers: software floor ---------- #
+def floor_guard(pose):
+    """Return a pose that is safe wrt MIN_BASE_Z.
+    - If CLAMP_BELOW_FLOOR is False: raise ValueError if below floor.
+    - If True: clamp Z to MIN_BASE_Z and return adjusted pose.
+    """
+    if pose[2] >= MIN_BASE_Z - 1e-9:
+        return pose
+    if CLAMP_BELOW_FLOOR:
+        p = list(pose)
+        p[2] = MIN_BASE_Z
+        print(f"[FLOOR] Clamped Z from {pose[2]:.3f} to {MIN_BASE_Z:.3f}")
+        return p
+    raise ValueError(f"Target Z={pose[2]:.3f} m is below floor ({MIN_BASE_Z:.3f} m).")
+
+def safe_moveL(rtde_c, rtde_r, target, speed, accel):
+    """Move with floor check. Returns False if rejected or move fails."""
+    try:
+        tgt = floor_guard(target)
+    except ValueError as e:
+        print(f"[FLOOR ABORT] {e}")
+        return False
+    ok = rtde_c.moveL(tgt, speed, accel)
+    return bool(ok)
+
 # ---------- EIT serial helpers ---------- #
 
 def open_eit_serial(port, baud, timeout):
@@ -209,15 +240,10 @@ def open_csv_logger(path, include_wrench=True, eit_cols=None):
 
 # ---------- Range tools ---------- #
 def frange_fixed_step(vmin, vmax, step):
-    """
-    Build values: vmin, vmin+step, ... <= vmax (inclusive if exact).
-    Increments are constant; if (vmax - vmin) % step != 0, the last value < vmax.
-    """
     if step <= 0:
         raise ValueError("step must be > 0")
     vals = []
     x = vmin
-    # guard against tiny float drift
     while x <= vmax + 1e-12:
         vals.append(round(x, 9))
         x += step
@@ -231,6 +257,11 @@ def build_ranges():
     P = frange_fixed_step(PITCH_MIN, PITCH_MAX, PITCH_STEP)
     Yaw = frange_fixed_step(YAW_MIN,  YAW_MAX,  YAW_STEP)
     return X, Y, Z, R, P, Yaw
+
+# ---------- Hover helpers ---------- #
+def add_z(pose, dz):
+    """Return pose with z shifted by dz (keep x,y,rx,ry,rz)."""
+    return [pose[0], pose[1], pose[2] + dz, pose[3], pose[4], pose[5]]
 
 # ---------------------------- main routine ---------------------------- #
 
@@ -255,7 +286,14 @@ def main():
 
         # 2) Anchor pose
         start_pose = rtde_r.getActualTCPPose() if USE_CURRENT_POSE_AS_START else EXPLICIT_START_POSE
-        print("Start anchor pose (base frame):", [round(v,6) for v in start_pose])
+        start_hover = add_z(start_pose, HOVER_LIFT_Z)
+        print("Start anchor pose:", [round(v,6) for v in start_pose])
+        print("Start hover pose :", [round(v,6) for v in start_hover])
+
+        # Move to hover before starting the sequence (with floor guard)
+        if not safe_moveL(rtde_c, rtde_r, start_hover, SPEED, ACCEL):
+            print("Cannot reach start hover (floor guard). Exiting.")
+            return
 
         # 3) Build discretized ranges
         X_OFFSETS, Y_OFFSETS, Z_OFFSETS, ROLL_DEG_LIST, PITCH_DEG_LIST, YAW_DEG_LIST = build_ranges()
@@ -270,8 +308,8 @@ def main():
             selected = full_grid
         else:
             k = min(RANDOM_SAMPLE_N, total)
-            random.seed(RANDOM_SEED)
-            selected = random.sample(full_grid, k)
+            rng = random.Random(RANDOM_SEED)  # independent RNG
+            selected = rng.sample(full_grid, k)
             print(f"Randomly selected {k} poses (seed={RANDOM_SEED}).")
 
         # open csv
@@ -282,16 +320,24 @@ def main():
         def rpy_combo_to_rvec(roll_deg, pitch_deg, yaw_deg, order="XYZ"):
             return rpy_to_rvec(deg2rad(roll_deg), deg2rad(pitch_deg), deg2rad(yaw_deg), order=order)
 
-        # 5) Iterate selected poses
+        # 5) Iterate selected poses with rise → reposition at hover → lower
         for idx, (dx, dy, dz, rdeg, pdeg, ydeg) in enumerate(selected, start=1):
             drx, dry, drz = rpy_combo_to_rvec(rdeg, pdeg, ydeg, order="XYZ")
-            delta_tool = [dx, dy, dz, drx, dry, drz]  # tool-frame delta
-            target = compose_pose(start_pose, delta_tool)
+            delta_tool   = [dx, dy, dz, drx, dry, drz]        # tool-frame delta
+            target       = compose_pose(start_pose, delta_tool)
+            target_hover = add_z(target, HOVER_LIFT_Z)        # same x,y,rx,ry,rz, but z + 100mm
 
-            print(f"[{idx}/{len(selected)}] target (m, rvec): {[round(v,6) for v in target]}")
-            ok = rtde_c.moveL(target, SPEED, ACCEL)
-            if not ok:
-                print("moveL() returned False — stopping.")
+            print(f"[{idx}/{len(selected)}] target      : {[round(v,6) for v in target]}")
+            print(f"                  target_hover: {[round(v,6) for v in target_hover]}")
+
+            # 1) Reposition at hover height
+            if not safe_moveL(rtde_c, rtde_r, target_hover, SPEED, ACCEL):
+                print("moveL() to target_hover rejected/failed — stopping.")
+                break
+
+            # 2) Lower straight down to target Z
+            if not safe_moveL(rtde_c, rtde_r, target, SPEED, ACCEL):
+                print("moveL() to target rejected/failed — stopping.")
                 break
 
             # Dwell & read EIT
@@ -341,9 +387,16 @@ def main():
             csv_w.writerow(row)
             csv_f.flush()
 
-        # Return to anchor
+            # 3) Rise back up to hover ready for the next pose
+            if not safe_moveL(rtde_c, rtde_r, target_hover, SPEED, ACCEL):
+                print("moveL() back to hover rejected/failed — stopping.")
+                break
+
+        # Return to anchor (hover, then lower)
         print("Returning to anchor pose.")
-        rtde_c.moveL(start_pose, SPEED, ACCEL)
+        if not safe_moveL(rtde_c, rtde_r, add_z(start_pose, HOVER_LIFT_Z), SPEED, ACCEL):
+            print("Could not move to start hover (floor guard).")
+        safe_moveL(rtde_c, rtde_r, start_pose, SPEED, ACCEL)
 
     finally:
         try:
