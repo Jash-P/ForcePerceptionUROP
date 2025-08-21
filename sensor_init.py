@@ -48,13 +48,13 @@ EXPLICIT_START_POSE = [0.40, -0.20, 0.20, 3.1415, 0.0, 0.0]
 
 # -------- RANGE MODE (min/max with fixed increments) --------
 # Distances in meters; angles in degrees. Increments are constant.
-X_MIN, X_MAX, X_STEP = -0.010, +0.010, 0.010    # ±10 mm in 10 mm steps (=> -10, 0, +10 mm)
-Y_MIN, Y_MAX, Y_STEP = -0.010, +0.010, 0.010
-Z_MIN, Z_MAX, Z_STEP =  0.000, +0.010, 0.005    # 0, +5, +10 mm
+X_MIN, X_MAX, X_STEP = -0.030, +0.030, 0.005    # ±30 mm in 5 mm steps (=> -10, 0, +10 mm)
+Y_MIN, Y_MAX, Y_STEP = -0.030, +0.030, 0.005
+Z_MIN, Z_MAX, Z_STEP =  0.000, +0.010, 0.001    # 0 - 10 mm in 1mm steps
 
-ROLL_MIN,  ROLL_MAX,  ROLL_STEP  = -10, +10, 10  # deg
-PITCH_MIN, PITCH_MAX, PITCH_STEP = -10, +10, 10
-YAW_MIN,   YAW_MAX,   YAW_STEP   = -20, +20, 20
+ROLL_MIN,  ROLL_MAX,  ROLL_STEP  = -10, +10, 1  # ±10 deg in 1 deg steps
+PITCH_MIN, PITCH_MAX, PITCH_STEP = -10, +10, 1
+YAW_MIN,   YAW_MAX,   YAW_STEP   = -20, +20, 1 # ±20 deg in 1 deg steps
 
 # Selection: do ALL poses or RANDOM sample of N
 SELECTION_MODE   = "RANDOM"   # "ALL" or "RANDOM"
