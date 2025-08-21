@@ -2,7 +2,7 @@
 import os, subprocess, json, time, threading, atexit
 
 HERE    = os.path.dirname(os.path.abspath(__file__))
-SERVICE = os.path.join(HERE, 'AR10_control', 'AR10_service.py')
+SERVICE = os.path.join(HERE, 'AR10_USB_control', 'AR10_service.py')
 print(f"[CLIENT] Looking for service at: {SERVICE!r}")
 assert os.path.isfile(SERVICE), "AR10_service.py not found"
 
