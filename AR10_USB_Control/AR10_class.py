@@ -89,8 +89,8 @@ class AR10:
 
     # convert joint number to channel number
     def joint_to_channel(self, joint):
-	channel = joint + 10
-	return channel
+        channel = joint + 10
+        return channel
 
     # Get the current position of the device on the specified channel
     # The result is returned in a measure of quarter-microseconds, which mirrors
