@@ -17,6 +17,11 @@ from math import prod
 from datetime import datetime
 from itertools import product
 
+import sys
+import platform
+import re
+from pathlib import Path
+
 import serial  # pip install pyserial
 
 from rtde_control import RTDEControlInterface as RTDEControl
@@ -31,21 +36,22 @@ TCP_OFFSET_AT_SENSOR_CENTER = [-0.020, 0.000, 0.100, 0.0, 0.0, 0.0]
 
 # Motion & dwell
 SPEED = 0.10          # m/s for XY/orientation + hover moves
-ACCEL = 0.10          # m/s^2
+ACCEL = 0.05          # m/s^2
 DWELL = 1.30          # s to settle & read EIT at final depth
 
 # Hover / retract height (applied to the controlled contact-point Z)
-HOVER_LIFT_Z = 0.100  # 100 mm
+HOVER_LIFT_Z = 0.025       # 25 mm (base value)
+HOVER_LIFT_Z_MIN = 0.050   # ensure a minimally higher hover when adapting
 
 # ---------- Active descent parameters (point-Z stepping) ----------
-DESCENT_SPEED     = 0.010   # m/s while stepping down
+DESCENT_SPEED     = 0.050   # m/s while stepping down
 DESCENT_ACCEL     = 0.100   # m/s^2
-STEP_Z            = 0.0005  # m per step (0.5 mm)
+STEP_Z            = 0.001  # m per step (0.5 mm)
 CONTACT_EXTRA_Z   = 0.0020  # m after detection (2 mm)
-STEP_SETTLE       = 0.05    # s pause after each step before sampling
+STEP_SETTLE       = 0.01    # s pause after each step before sampling
 
 # If no EIT change at the planned target depth, keep lowering by up to this extra:
-NO_CONTACT_EXTRA_Z = 0.004  # 4 mm beyond planned target (still obeys floor guard)
+NO_CONTACT_EXTRA_Z = 0.020  # 20mm beyond planned target (still obeys floor guard)
 
 # Detection settings (baseline vs. live)
 BASELINE_SAMPLES  = 20      # EIT lines at hover to build baseline
@@ -53,6 +59,13 @@ DETECT_METHOD     = "sigma" # "sigma" (z-score) or "abs"
 K_SIGMA           = 6.0     # trigger when mean |zscore| ≥ K_SIGMA
 ABS_THRESHOLD     = 0.05    # if DETECT_METHOD=="abs": trigger when mean |x-mu| ≥ ABS_THRESHOLD
 MIN_CONSEC_TRIG   = 2       # require N consecutive triggers to confirm contact
+
+# Runtime safety (live watchdog)
+RUNTIME_FLOOR_EPS   = 0.003   # extra 3 mm buffer for live checks
+SEG_MAX_DPOS        = 0.005   # max segment length (m) per guarded step
+SEG_MIN_STEPS       = 6       # at least this many segments per long move
+WATCHDOG_POLL_DT    = 0.008   # ~125 Hz polling during motion
+WATCHDOG_TIMEOUT_S  = 6.0     # per-segment timeout (s)
 
 # ---------- Tool line through x=0 (tool frame) ----------
 TOUCH_POINT_YZ    = (0.0, -0.050)  # (y0, z0) at x=0; e.g., 50 mm below TCP along tool -Z
@@ -67,15 +80,52 @@ CLAMP_BELOW_FLOOR = True     # True: lift to keep safe; False: abort moves that 
 GUARD_XLINE  = True          # also guard the x-line endpoints besides the chosen contact point
 GUARD_ARM_LINKS = True       # guard all UR5 links via FK+IK
 
+# ---- Robust EIT/force detection knobs ----
+EIT_MIN_COLS           = 8       # ignore frames that have fewer columns than this
+EIT_PER_STEP_SAMPLES   = 4       # read N lines after each Z step, average the score
+EIT_MEDIAN_FILTER_WIN  = 3       # median filter window (odd). Set 1 to disable.
+K_SIGMA                = 3.5     # lowered from 6.0 → easier to trigger real contact
+MIN_CONSEC_TRIG        = 2       # unchanged: consecutive step confirmations
+
+# Optional backup trigger via TCP force (Newtons). Set FORCE_THR_N=None to disable.
+FORCE_THR_N            = 8.0     # ~8 N normal force
+FORCE_MIN_CONSEC       = 2       # consecutive polls over threshold to confirm
+
+
 # Logging
 LOG_CSV_PATH = "eit_localisation_log.csv"
 LOG_WRENCH   = True
 
-# EIT serial
-EIT_PORT = "COM5"            # use "/dev/ttyUSB0" or "/dev/ttyACM0" on Linux
+# ------------------ WSL/Windows-friendly EIT serial ------------------ #
+# Windows COM ports map to /dev/ttyS<NUM> in WSL/Linux (COM5 -> /dev/ttyS5).
+# You can override the port via env var: EIT_PORT=/dev/ttyS5 python script.py
+EIT_PORT = "/dev/ttyACM0"    # mapped serial device in WSL
 EIT_BAUD = 115200
 EIT_TIMEOUT = 0.2
 EIT_SNIFF_SECS = 2.0
+# Some devices need DTR/RTS; many USB serial EIT boards do not:
+EIT_DSRDTR = False
+EIT_RTSCTS = False
+
+def map_com_to_ttyS(port_str: str) -> str:
+    """Map 'COM5' -> '/dev/ttyS5' on Linux/WSL. Return original if not 'COM<d>'."""
+    m = re.match(r"^COM(\d+)$", port_str, re.IGNORECASE)
+    if not m:
+        return port_str
+    n = int(m.group(1))
+    return f"/dev/ttyS{n}"
+
+def resolve_serial_candidates(port_str: str):
+    """
+    Produce a list of port names to try in order, depending on OS/WSL.
+    - On Windows: ['COM5', '/dev/ttyS5']
+    - On Linux/WSL: ['/dev/ttyS5', 'COM5']
+    """
+    mapped = map_com_to_ttyS(port_str)
+    if sys.platform.startswith("win"):
+        return [port_str, mapped]
+    else:
+        return [mapped, port_str]
 
 # Anchor pose
 USE_CURRENT_POSE_AS_START = True
@@ -168,13 +218,8 @@ def rpy_to_rotmat(roll, pitch, yaw):
     Ry = [[cy,0,sy],[0,1,0],[-sy,0,cy]]
     Rz = [[cz,-sz,0],[sz,cz,0],[0,0,1]]
     def mm(A,B):
-        return [[A[0][0]*B[0][0]+A[0][1]*B[1][0]+A[0][2]*B[2][0],
-                 A[0][0]*B[0][1]+A[0][1]*B[1][1]+A[0][2]*B[2][1],
-                 A[0][0]*B[0][2]+A[0][1]*B[1][2]+A[0][2]*B[2][2]],
-                [A[1][0]*B[0][0]+A[1][1]*B[1][0]+A[1][2]*B[2][0],
-                 A[1][0]*B[0][1]+A[1][1]*B[1][1]+A[1][2]*B[2][1],
-                 A[2][0]*B[0][0]+A[2][1]*B[1][0]+A[2][2]*B[2][0],
-                 ]]
+        # robust 3x3 multiply
+        return [[sum(A[i][k]*B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
     return mm(mm(Rx,Ry),Rz)
 
 def pose_to_tf(p):
@@ -298,6 +343,19 @@ def tcp_pose_for_desired_point_z(pose_like_tcp, point_tool):
     tcp_z = desired_point_z - dz
     return [x,y,tcp_z, rx,ry,rz]
 
+# --- NEW: helpers to build/check the exact TCP for a given point-Z ---
+def tcp_from_pointZ(base_tcp, point_tool, desired_point_z):
+    """Compose a TCP pose that yields desired Z at the specified tool point."""
+    return tcp_pose_for_desired_point_z(
+        [base_tcp[0], base_tcp[1], desired_point_z, base_tcp[3], base_tcp[4], base_tcp[5]],
+        point_tool
+    )
+
+def ik_ok_for_pointZ(rtde_c, rtde_r, base_tcp, point_tool, desired_point_z):
+    """Return a safe IK solution (list of 6) for the TCP that realizes desired point-Z, or None."""
+    tcp_pose = tcp_from_pointZ(base_tcp, point_tool, desired_point_z)
+    return try_ik_with_seeds(rtde_c, rtde_r, tcp_pose)
+
 def linspace(a,b,n):
     if n<=1: return [0.5*(a+b)]
     step = (b-a)/(n-1)
@@ -342,6 +400,66 @@ UR5_DH = {
     "alf": [math.pi/2, 0.0, 0.0, math.pi/2, -math.pi/2, 0.0]
 }
 
+# ---- Joint limit safety filter ----
+# UR5 software/mech limits (radians)
+UR5_LIMITS = [
+    (-2*math.pi,  2*math.pi),         # Base (pan)
+    (-math.pi,    math.pi/2),         # Shoulder  (-180° to +90°)
+    (-2.618,      2.618),             # Elbow     (-150° to +150°)
+    (-math.pi,    math.pi),           # Wrist1    (-180° to +180°)
+    (-math.pi,    math.pi),           # Wrist2    (-180° to +180°)
+    (-math.pi,    math.pi),           # Wrist3    (-180° to +180°)
+]
+SAFE_MARGIN = 0.10        # rad buffer (~6°)
+COMFORT_MARGIN = 0.20     # rad buffer for deciding if we should go HOME
+
+def within_joint_limits(q):
+    if not q or len(q) != 6:
+        return False
+    for qi, (lo, hi) in zip(q, UR5_LIMITS):
+        if qi < lo + SAFE_MARGIN or qi > hi - SAFE_MARGIN:
+            return False
+    return True
+
+def comfortably_within_limits(q):
+    if not q or len(q) != 6:
+        return False
+    for qi, (lo, hi) in zip(q, UR5_LIMITS):
+        if qi < lo + COMFORT_MARGIN or qi > hi - COMFORT_MARGIN:
+            return False
+    return True
+
+# A safe, neutral HOME posture (UR standard-ish)
+HOME_Q = [0.0, -math.pi/2,  math.pi/2,  0.0,  math.pi/2,  0.0]
+HOME_SPEED = 0.4
+HOME_ACCEL = 0.8
+
+def try_ik_with_seeds(rtde_c, rtde_r, tcp_pose, extra_seeds=None):
+    """
+    Try IK with multiple seeds; return the first solution that is within limits.
+    Seeds order: q_current, HOME_Q, (optional) extra_seeds.
+    """
+    seeds = []
+    try:
+        qc = rtde_r.getActualQ()
+        if qc and len(qc) == 6:
+            seeds.append(qc)
+    except Exception:
+        pass
+    seeds.append(HOME_Q)
+    if extra_seeds:
+        seeds.extend(extra_seeds)
+
+    for seed in seeds:
+        try:
+            q = rtde_c.getInverseKinematics(tcp_pose, seed)
+            if q and len(q) == 6 and within_joint_limits(q):
+                return q
+        except Exception:
+            continue
+    return None
+
+
 def RzTxRx(theta, d, a, alpha):
     c,s = math.cos(theta), math.sin(theta)
     ca,sa = math.cos(alpha), math.sin(alpha)
@@ -374,70 +492,164 @@ def min_arm_z(q):
 # ---- Hardened move that guards point, x-line, TCP & arm links ----
 def safe_move_pointZ(rtde_c, rtde_r, pose_pointZ, point_tool, speed, accel):
     """
-    pose_pointZ=[x,y, desired_point_z, rx,ry,rz]; move so *point_tool* hits desired Z AND
-    ensure TCP and arm links don't go below MIN_BASE_Z + FLOOR_MARGIN. Lifts the commanded
-    Z if needed (when clamping enabled).
+    Move so *point_tool* reaches desired Z, enforcing floor limits for the chosen
+    tool points/TCP AND live actual feedback during the move. The motion is split
+    into small guarded segments; each segment is cancelled if live Z dips below
+    the runtime floor.
+    Returns: (ok: bool, final_tcp_pose: list[6])
     """
-    limit = MIN_BASE_Z + FLOOR_MARGIN
+    limit_static = MIN_BASE_Z + FLOOR_MARGIN
+    limit_runtime = limit_static + RUNTIME_FLOOR_EPS
+
     desired_point_z = enforce_point_floor_z(pose_pointZ[2])
-    pose_pointZ = [pose_pointZ[0], pose_pointZ[1], desired_point_z, pose_pointZ[3], pose_pointZ[4], pose_pointZ[5]]
+    pose_pointZ = [pose_pointZ[0], pose_pointZ[1], desired_point_z,
+                   pose_pointZ[3], pose_pointZ[4], pose_pointZ[5]]
+
     guard_pts = build_guard_points(point_tool)
 
-    adjusted = 0.0
-    for _ in range(20):  # up to 20 corrective lifts
-        tcp_pose = tcp_pose_for_desired_point_z(pose_pointZ, point_tool)
+    # --- Build final target TCP from desired point-Z
+    tcp_target = tcp_pose_for_desired_point_z(pose_pointZ, point_tool)
 
-        # Guard tool points + TCP height
-        zs = []
-        for p in guard_pts:
-            zs.append( world_point_from_tool(tcp_pose, p)[2] )
-        zs.append(tcp_pose[2])
-        min_z_tool = min(zs)
+    # --- Pre-check IK & arm links for the final pose
+    q_final = try_ik_with_seeds(rtde_c, rtde_r, tcp_target)
+    if not q_final:
+        print("[JOINT LIMIT] Skipping pose: IK near joint limits (all seeds).")
+        return False, tcp_target
+    # Evaluate lowest Z among tool guard points, TCP, and arm links
+    zs_tool = [world_point_from_tool(tcp_target, p)[2] for p in guard_pts] + [tcp_target[2]]
+    min_z_all = min(min(zs_tool), min_arm_z(q_final))
+    if min_z_all < limit_static - 1e-9:
+        # Try clamping up in Z (raise desired point-Z) until safe or give up
+        adjusted = 0.0
+        for _ in range(20):
+            deficit = (limit_static - min_z_all)
+            pose_pointZ[2] += deficit
+            adjusted += deficit
+            tcp_target = tcp_pose_for_desired_point_z(pose_pointZ, point_tool)
+            q_final = try_ik_with_seeds(rtde_c, rtde_r, tcp_target)
+            if not q_final:
+                continue
+            zs_tool = [world_point_from_tool(tcp_target, p)[2] for p in guard_pts] + [tcp_target[2]]
+            min_z_all = min(min(zs_tool), min_arm_z(q_final))
+            if min_z_all >= limit_static - 1e-9:
+                if adjusted > 0:
+                    print(f"[FLOOR] Raised target by {adjusted*1000:.1f} mm to maintain margin.")
+                break
+        if min_z_all < limit_static - 1e-9:
+            print("[FLOOR ABORT] Could not find safe target even after clamping.")
+            return False, tcp_target
 
-        # Guard arm links (via IK + FK)
-        min_z_arm = min_z_tool
-        if GUARD_ARM_LINKS:
+    # --- Segment the move from CURRENT to TARGET and watchdog each segment
+    try:
+        tcp_curr = rtde_r.getActualTCPPose()
+    except Exception:
+        tcp_curr = tcp_target[:]  # fallback
+
+    def lerp(a, b, t):
+        return [a[i] + (b[i] - a[i]) * t for i in range(6)]
+
+    # Number of segments based on distance in TCP space (xyz only)
+    dist = math.sqrt((tcp_target[0]-tcp_curr[0])**2 +
+                     (tcp_target[1]-tcp_curr[1])**2 +
+                     (tcp_target[2]-tcp_curr[2])**2)
+    steps = max(SEG_MIN_STEPS, int(math.ceil(dist / SEG_MAX_DPOS)))
+
+    for k in range(1, steps+1):
+        t = k / steps
+        seg_tcp = lerp(tcp_curr, tcp_target, t)
+
+        # IK + predicted floor check for the segment endpoint
+        q_seg = try_ik_with_seeds(rtde_c, rtde_r, seg_tcp)
+        if not q_seg:
+            print("[GUARD] Segment IK failed near joint limits; aborting.")
+            return False, tcp_curr
+
+        zs_tool = [world_point_from_tool(seg_tcp, p)[2] for p in guard_pts] + [seg_tcp[2]]
+        min_z_pred = min(min(zs_tool), min_arm_z(q_seg))
+        if min_z_pred < limit_static - 1e-9:
+            print("[GUARD] Segment would violate static floor; aborting.")
+            return False, tcp_curr
+
+        # Command small moveL to seg_tcp
+        ok_cmd = rtde_c.moveL(seg_tcp, speed, accel)
+        if not ok_cmd:
+            print("[MOVE] moveL command failed; aborting.")
+            return False, tcp_curr
+
+        # Live watchdog while we wait for the segment to complete
+        t0 = time.time()
+        while time.time() - t0 < WATCHDOG_TIMEOUT_S:
             try:
-                q_current = rtde_r.getActualQ()
-                q_tgt = rtde_c.getInverseKinematics(tcp_pose, q_current)
-                if q_tgt and len(q_tgt) == 6:
-                    min_z_arm = min_arm_z(q_tgt)
+                atcp = rtde_r.getActualTCPPose()
+                # Hard runtime floor on actual TCP Z
+                if atcp[2] < limit_runtime:
+                    print(f"[WATCHDOG] Actual TCP Z {atcp[2]:.3f} < runtime limit {limit_runtime:.3f}. Stopping.")
+                    try:
+                        rtde_c.speedStop()
+                    except Exception:
+                        pass
+                    return False, atcp
+
+                # Optional: quick arm link estimate (use current joint state)
+                if GUARD_ARM_LINKS:
+                    try:
+                        q_now = rtde_r.getActualQ()
+                        if q_now and min_arm_z(q_now) < limit_runtime:
+                            print("[WATCHDOG] Arm link below runtime floor. Stopping.")
+                            try:
+                                rtde_c.speedStop()
+                            except Exception:
+                                pass
+                            return False, atcp
+                    except Exception:
+                        pass
             except Exception:
-                min_z_arm = min_z_tool
+                pass
+            # crude completion check (close enough in xyz)
+            if (abs(seg_tcp[0]-atcp[0]) < 1e-4 and
+                abs(seg_tcp[1]-atcp[1]) < 1e-4 and
+                abs(seg_tcp[2]-atcp[2]) < 1e-4):
+                break
+            time.sleep(WATCHDOG_POLL_DT)
 
-        min_z_all = min(min_z_tool, min_z_arm)
+        # proceed to next segment
+        tcp_curr = seg_tcp[:]
 
-        if min_z_all >= limit - 1e-9:
-            if adjusted > 0:
-                print(f"[FLOOR] Raised target by {adjusted*1000:.1f} mm to maintain margin.")
-            ok = rtde_c.moveL(tcp_pose, speed, accel)
-            return bool(ok), tcp_pose
+    return True, tcp_target
 
-        # Need to lift
-        deficit = (limit - min_z_all)
-        if not CLAMP_BELOW_FLOOR:
-            print(f"[FLOOR ABORT] minZ={min_z_all:.3f} < limit={limit:.3f}. "
-                  f"Required lift {deficit*1000:.1f} mm.")
-            return False, tcp_pose
-
-        pose_pointZ[2] += deficit
-        adjusted += deficit
-
-    print("[FLOOR ABORT] Too many corrective lifts; giving up.")
-    return False, tcp_pose
 
 # ============================ EIT & DETECTION ============================
 
 def open_eit_serial(port, baud, timeout):
-    try:
-        ser = serial.Serial(port=port, baudrate=baud, timeout=timeout)
-        time.sleep(0.2)
-        ser.reset_input_buffer()
-        print(f"EIT serial on {port} @ {baud}.")
-        return ser
-    except Exception as e:
-        print(f"WARNING: Could not open EIT serial on {port}: {e}")
-        return None
+    """
+    Try OS-appropriate candidates and print per-candidate errors so it’s obvious
+    why each attempt failed (e.g., permission denied vs. port busy).
+    """
+    candidates = resolve_serial_candidates(port)
+    errors = []
+    for p in candidates:
+        try:
+            if p.startswith("/dev/") and not Path(p).exists():
+                errors.append((p, "device node not found"))
+                continue
+            ser = serial.Serial(
+                port=p,
+                baudrate=baud,
+                timeout=timeout,
+                dsrdtr=EIT_DSRDTR,
+                rtscts=EIT_RTSCTS,
+            )
+            time.sleep(0.2)
+            try: ser.reset_input_buffer()
+            except Exception: pass
+            print(f"EIT serial on {p} @ {baud}.")
+            return ser
+        except Exception as e:
+            errors.append((p, str(e)))
+    print("[WARNING] Could not open EIT serial. Tried:")
+    for p, err in errors:
+        print(f"  - {p}: {err}")
+    return None
 
 def read_eit_line(ser, timeout_s):
     if not ser: return ""
@@ -451,39 +663,78 @@ def read_eit_line(ser, timeout_s):
     return last
 
 def parse_eit_csv(s):
+    """
+    Parse 1 CSV line of EIT values -> list[float] or None.
+    Filters obviously short frames.
+    """
     try:
-        return [float(x.strip()) for x in s.split(",") if x.strip() != ""]
+        vals = [float(x.strip()) for x in s.split(",") if x.strip() != ""]
+        if len(vals) < EIT_MIN_COLS:
+            return None
+        return vals
     except Exception:
         return None
 
+def _robust_mean_sd(cols):
+    """
+    Given iterable of columns (list-of-lists by channel), return mean and a robust sd per channel.
+    sd uses max(pop SD, 1.4826*MAD, eps) to avoid zero-variance stalls.
+    """
+    mu = [statistics.fmean(col) for col in cols]
+    sd = []
+    for col in cols:
+        try:
+            pop = statistics.pstdev(col)
+        except Exception:
+            pop = 0.0
+        # MAD
+        m = statistics.fmean(col)
+        mad = statistics.fmedian([abs(v - m) for v in col]) if hasattr(statistics, 'fmedian') else statistics.median([abs(v - m) for v in col])
+        robust = 1.4826 * mad
+        s = max(pop, robust, 1e-9)
+        sd.append(s)
+    return mu, sd
+
 def baseline_eit(ser, n=BASELINE_SAMPLES, per_line_timeout=EIT_TIMEOUT):
+    """
+    Read n frames at hover; build robust baseline (mu, sd).
+    """
+    if not ser: return None, None, ""
     vals = []
+    last_raw = ""
     for _ in range(n):
         s = read_eit_line(ser, per_line_timeout)
-        v = parse_eit_csv(s)
-        if v is not None: vals.append(v)
+        last_raw = s or last_raw
+        v = parse_eit_csv(s) if s else None
+        if v is not None:
+            vals.append(v)
         time.sleep(0.005)
     if not vals:
-        return None, None, ""
+        return None, None, last_raw
+
     m = min(len(v) for v in vals)
     vals = [v[:m] for v in vals]
-    mu = [statistics.fmean(col) for col in zip(*vals)]
-    sd = []
-    for col in zip(*vals):
-        try:
-            sd.append(statistics.pstdev(col))
-        except Exception:
-            sd.append(0.0)
-    return mu, sd, ",".join(str(x) for x in vals[-1])
+    cols = list(zip(*vals))  # channel-wise lists
+    mu, sd = _robust_mean_sd(cols)
+    return mu, sd, last_raw
+
+def _median_filter(x_list, win):
+    if win <= 1 or len(x_list) < 2: return x_list[:]
+    if win % 2 == 0: win += 1
+    k = win // 2
+    out = []
+    for i in range(len(x_list)):
+        a = max(0, i-k); b = min(len(x_list), i+k+1)
+        out.append(sorted(x_list[a:b])[len(range(a,b))//2])
+    return out
 
 def change_score(curr, mu, sd, method="sigma"):
-    if curr is None or mu is None: return None
-    m = min(len(curr), len(mu))
+    """
+    Mean absolute z-score across channels. Uses robust sd from baseline.
+    """
+    if curr is None or mu is None or sd is None: return None
+    m = min(len(curr), len(mu), len(sd))
     if m == 0: return None
-    if method == "abs":
-        diffs = [abs(curr[i] - mu[i]) for i in range(m)]
-        return sum(diffs)/m
-    # sigma
     eps = 1e-9
     zs = [abs(curr[i]-mu[i]) / (sd[i] if sd[i] > eps else 1.0) for i in range(m)]
     return sum(zs)/m
@@ -505,41 +756,48 @@ def active_descend_to_contact(rtde_c, rtde_r, base_tcp, point_tool,
                               no_contact_extra=NO_CONTACT_EXTRA_Z):
     """
     Step the *controlled point-Z* from hover toward planned_target_point_z.
-    - If EIT change is detected: go an additional `post_extra` deeper and stop.
-    - If NOT detected at the planned target: continue up to `no_contact_extra` deeper, then stop.
-    Always obeys MIN_BASE_Z via floor guard.
-    Returns: (ok, tcp_final, contact_info_dict)
+    Uses robust EIT detection with multiple frames per step and optional
+    force-based backup trigger. Returns: (ok, tcp_final, info)
     """
-    # Baseline at hover (if serial available)
+    # Fresh baseline at hover
     mu, sd, _ = baseline_eit(ser) if ser else (None, None, "")
     if ser and mu is None:
         print("[EIT] Baseline failed; descending without detection gating.")
 
-    # Decide descent direction (UR Base Z up; lowering means target < hover)
+    # Direction: lowering means target < hover (UR Base Z up)
     direction = -1.0 if planned_target_point_z < start_point_z else +1.0
 
-    # If target is above hover, just move there and finish
+    # If target above hover: simple guarded move
     if direction > 0:
         pose_pointZ = [base_tcp[0], base_tcp[1], planned_target_point_z,
                        base_tcp[3], base_tcp[4], base_tcp[5]]
         ok, tcp_pose = safe_move_pointZ(rtde_c, rtde_r, pose_pointZ, point_tool, speed, accel)
-        info = dict(triggered=False, score=None, z_contact=None, z_final=planned_target_point_z)
+        info = dict(triggered=False, score=None, z_contact=None, z_final=planned_target_point_z,
+                    mode="upmove")
         return ok, tcp_pose, info
 
-    # Going DOWN: allow continuing beyond planned target by `no_contact_extra`
-    deeper_limit_z = planned_target_point_z + direction * abs(no_contact_extra)  # direction = -1 → planned - extra
+    deeper_limit_z = planned_target_point_z + direction * abs(no_contact_extra)
 
-    consec = 0
+    # (Optional) running median filter and history for debug
+    score_hist = []
+    consec_eit = 0
+    consec_force = 0
     z_contact = None
     current_z = start_point_z
     tcp_pose = None
-    score = None
+    last_score = None
+
+    # Ensure serial buffer is clean before starting the loop
+    if ser:
+        try: ser.reset_input_buffer()
+        except Exception: pass
 
     while True:
         # Step toward deeper_limit_z
         next_z = current_z + direction * step_z
         if direction < 0 and next_z < deeper_limit_z:
             next_z = deeper_limit_z
+
         pose_pointZ = [base_tcp[0], base_tcp[1], next_z,
                        base_tcp[3], base_tcp[4], base_tcp[5]]
         ok, tcp_pose = safe_move_pointZ(rtde_c, rtde_r, pose_pointZ, point_tool, speed, accel)
@@ -547,23 +805,59 @@ def active_descend_to_contact(rtde_c, rtde_r, base_tcp, point_tool,
             print("[MOVE] Step move rejected/failed; aborting descent.")
             break
         current_z = next_z
+
+        # small settle
         time.sleep(step_settle)
 
-        # Score latest line if we have a baseline
+        # ----- collect multiple EIT frames and average their score -----
+        scores = []
         if ser and mu is not None:
-            s = read_eit_line(ser, EIT_TIMEOUT)
-            curr = parse_eit_csv(s) if s else None
-            score = change_score(curr, mu, sd, method=method)
+            for _ in range(max(1, EIT_PER_STEP_SAMPLES)):
+                s = read_eit_line(ser, EIT_TIMEOUT)
+                v = parse_eit_csv(s) if s else None
+                sc = change_score(v, mu, sd, method=method) if v is not None else None
+                if sc is not None:
+                    scores.append(sc)
+                # a tiny pause between frames to avoid spamming
+                time.sleep(0.003)
 
-            triggered = False
-            if score is not None:
-                triggered = (score >= (k_sigma if method == "sigma" else abs_thr))
+        if scores:
+            if EIT_MEDIAN_FILTER_WIN > 1:
+                scores = _median_filter(scores, EIT_MEDIAN_FILTER_WIN)
+            last_score = sum(scores)/len(scores)
+            score_hist.append(last_score)
+            print(f"[EIT] z={current_z:.4f} m, score≈{last_score:.2f}")
+        else:
+            last_score = None
+            print(f"[EIT] z={current_z:.4f} m, no valid frame")
 
-            consec = consec + 1 if triggered else 0
-            if consec >= min_consec:
-                z_contact = current_z
-                print(f"[CONTACT] change detected (score={score:.2f}) at z={z_contact:.4f} m")
-                break
+        # ----- force backup trigger (optional) -----
+        force_trigger = False
+        if FORCE_THR_N is not None:
+            try:
+                Fx,Fy,Fz,Tx,Ty,Tz = rtde_r.getActualTCPForce()
+                # Consider only downward (negative Z) or absolute? Here absolute:
+                if abs(Fz) >= FORCE_THR_N:
+                    consec_force += 1
+                else:
+                    consec_force = 0
+                if consec_force >= FORCE_MIN_CONSEC:
+                    force_trigger = True
+            except Exception:
+                pass
+
+        # ----- evaluate triggers -----
+        eit_trigger = False
+        if last_score is not None:
+            thr = (k_sigma if method == "sigma" else abs_thr)
+            eit_trigger = last_score >= thr
+            consec_eit = consec_eit + 1 if eit_trigger else 0
+
+        if (consec_eit >= min_consec) or force_trigger:
+            z_contact = current_z
+            print(f"[CONTACT] detected at z={z_contact:.4f} m "
+                  f"({'force' if force_trigger else 'eit'}; score={last_score})")
+            break
 
         # Stop if we reached allowed deeper limit with no trigger
         if abs(current_z - deeper_limit_z) < 1e-12:
@@ -571,7 +865,7 @@ def active_descend_to_contact(rtde_c, rtde_r, base_tcp, point_tool,
                 print("[CONTACT] No change detected — stopped at deeper limit.")
             break
 
-    # If detected contact, go post-contact extra and stop
+    # If detected, go a bit deeper and stop
     if z_contact is not None:
         final_z = z_contact + direction * abs(post_extra)
         pose_pointZ = [base_tcp[0], base_tcp[1], final_z,
@@ -582,12 +876,15 @@ def active_descend_to_contact(rtde_c, rtde_r, base_tcp, point_tool,
             tcp_pose = tcp_pose2
         else:
             print("[CONTACT] Post-extra move rejected/failed — holding at contact.")
-        info = dict(triggered=True, score=score, z_contact=z_contact, z_final=current_z)
+        info = dict(triggered=True, score=last_score, z_contact=z_contact, z_final=current_z,
+                    score_hist=score_hist[-20:])
         return True, tcp_pose, info
 
-    # Otherwise we stopped at deeper_limit_z (no trigger)
-    info = dict(triggered=False, score=score, z_contact=None, z_final=current_z)
+    # Otherwise we stopped at deeper limit (no trigger)
+    info = dict(triggered=False, score=last_score, z_contact=None, z_final=current_z,
+                score_hist=score_hist[-20:])
     return True, tcp_pose, info
+
 
 # ============================== CSV LOG ==============================
 
@@ -646,7 +943,6 @@ def fast_random_product_sample(axes_lists, k, seed=None, max_tries=1000000):
     return list(chosen)
 
 # ============================== MAIN ==============================
-
 def main():
     rtde_c = RTDEControl(ROBOT_IP)
     rtde_r = RTDEReceive(ROBOT_IP)
@@ -665,15 +961,27 @@ def main():
         start_tcp = rtde_r.getActualTCPPose() if USE_CURRENT_POSE_AS_START else EXPLICIT_START_POSE
         print("Start TCP pose:", [round(v,6) for v in start_tcp])
 
-        # Compute current contact-point Z (x=0) and rise to hover
+        # Optional: if current joints are uncomfortable, go to HOME once
+        try:
+            q_now = rtde_r.getActualQ()
+            if not comfortably_within_limits(q_now):
+                print("[INFO] Current joints near limits; moving to HOME first.")
+                try:
+                    rtde_c.moveJ(HOME_Q, HOME_SPEED, HOME_ACCEL)
+                    time.sleep(0.2)
+                except Exception as e:
+                    print(f"[WARN] moveJ to HOME failed ({e}); continuing without it.")
+        except Exception:
+            pass
+
+        # Compute current contact-point Z (x=0) and rise to hover once
         y0, z0 = TOUCH_POINT_YZ
         current_point_z = world_point_z_for_tcp_pose(start_tcp, (0.0, y0, z0))
         start_point_hover = [start_tcp[0], start_tcp[1], current_point_z + HOVER_LIFT_Z,
                              start_tcp[3], start_tcp[4], start_tcp[5]]
         ok, _ = safe_move_pointZ(rtde_c, rtde_r, start_point_hover, (0.0, y0, z0), SPEED, ACCEL)
         if not ok:
-            print("Cannot reach start hover (floor guard). Exiting.")
-            return
+            print("[WARN] Cannot reach global start hover (floor/joint guard). Continuing anyway.")
 
         # 3) Build discretized ranges
         Xs = frange(X_MIN, X_MAX, X_STEP)
@@ -682,20 +990,6 @@ def main():
         Rls = frange(ROLL_MIN,  ROLL_MAX,  ROLL_STEP)
         Pcs = frange(PITCH_MIN, PITCH_MAX, PITCH_STEP)
         Yws = frange(YAW_MIN,   YAW_MAX,   YAW_STEP)
-
-        axes_lists = [Xs, Ys, Zs, Rls, Pcs, Yws]
-        total_count = prod(len(L) for L in axes_lists)
-        print(f"Grid cardinality (not materialized): {total_count:,}")
-
-        # 4) Choose iteration WITHOUT building the full list
-        if SELECTION_MODE.upper() == "ALL":
-            selected_iter = product(*axes_lists)   # generator
-            total_known = total_count
-        else:
-            selected_list = fast_random_product_sample(axes_lists, RANDOM_SAMPLE_N, seed=RANDOM_SEED)
-            selected_iter = iter(selected_list)
-            total_known = len(selected_list)
-            print(f"Randomly selected {total_known} poses (seed={RANDOM_SEED}).")
 
         # open csv
         session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -706,8 +1000,51 @@ def main():
             R = rpy_to_rotmat(deg2rad(roll_deg), deg2rad(pitch_deg), deg2rad(yaw_deg))
             return rotmat_to_rvec(R)
 
-        # 5) Iterate poses
-        for idx, (dx, dy, dz, rdeg, pdeg, ydeg) in enumerate(selected_iter, start=1):
+        # 4) Random sampling until N successful poses, with adaptive shrinking
+        rng = random.Random(RANDOM_SEED)
+        successful = 0
+        attempted = 0
+        max_attempts = 10 * RANDOM_SAMPLE_N
+
+        # Mutable ranges for adaptation
+        dx_range = list(Xs)
+        dy_range = list(Ys)
+        dz_range = list(Zs)
+        roll_range = list(Rls)
+        pitch_range = list(Pcs)
+        yaw_range = list(Yws)
+
+        consecutive_skips = 0
+
+        def halve_centered(vals):
+            if len(vals) < 3:
+                return vals
+            mid = len(vals)//2
+            span = max(1, len(vals)//4)
+            lo = max(0, mid - span)
+            hi = min(len(vals), mid + span + 1)
+            return vals[lo:hi]
+
+        def shrink_ranges():
+            nonlocal dx_range, dy_range, roll_range, pitch_range, yaw_range
+            dx_range[:] = halve_centered(dx_range)
+            dy_range[:] = halve_centered(dy_range)
+            roll_range[:] = halve_centered(roll_range)
+            pitch_range[:] = halve_centered(pitch_range)
+            yaw_range[:] = halve_centered(yaw_range)
+            print("[ADAPT] Shrunk search ranges to improve feasibility.")
+
+        while successful < RANDOM_SAMPLE_N and attempted < max_attempts:
+            attempted += 1
+
+            # pick a random pose from (possibly shrunk) ranges
+            dx = rng.choice(dx_range)
+            dy = rng.choice(dy_range)
+            dz = rng.choice(dz_range)
+            rdeg = rng.choice(roll_range)
+            pdeg = rng.choice(pitch_range)
+            ydeg = rng.choice(yaw_range)
+
             drx, dry, drz = rpy_combo_to_rvec(rdeg, pdeg, ydeg)
             base_tcp = compose_pose(start_tcp, [dx, dy, 0.0, drx, dry, drz])
 
@@ -715,20 +1052,36 @@ def main():
             x_sel = first_contact_x_along_tool_line(base_tcp)
             point_tool = (x_sel, TOUCH_POINT_YZ[0], TOUCH_POINT_YZ[1])
 
-            # Planned contact-point Z (relative to the start point’s contact Z at x=0).
-            # NOTE: If your dz is "depth-positive" (down), use start_point_z - dz instead.
+            # Planned contact-point Z and hover Z
             start_point_z_ref = world_point_z_for_tcp_pose(start_tcp, (0.0, TOUCH_POINT_YZ[0], TOUCH_POINT_YZ[1]))
             planned_point_z = start_point_z_ref + dz
+            hover_z = planned_point_z + max(HOVER_LIFT_Z, HOVER_LIFT_Z_MIN)
 
-            # Go to hover above planned target at current XY/orientation
-            hover_pointZ = [base_tcp[0], base_tcp[1], planned_point_z + HOVER_LIFT_Z,
+            # Early IK check specifically for the HOVER TCP (what we will actually command)
+            q_hover = ik_ok_for_pointZ(rtde_c, rtde_r, base_tcp, point_tool, hover_z)
+            if not q_hover:
+                print("[SKIP] Cannot reach hover safely — skipping pose.")
+                consecutive_skips += 1
+                if consecutive_skips in (10, 20, 30):
+                    shrink_ranges()
+                continue
+
+            # Try to hover above planned target (guards inside)
+            hover_pointZ = [base_tcp[0], base_tcp[1], hover_z,
                             base_tcp[3], base_tcp[4], base_tcp[5]]
             ok, _ = safe_move_pointZ(rtde_c, rtde_r, hover_pointZ, point_tool, SPEED, ACCEL)
             if not ok:
-                print("moveL() to hover (guards) rejected/failed — skipping pose.")
+                print("[SKIP] Cannot reach hover safely — skipping pose.")
+                consecutive_skips += 1
+                if consecutive_skips in (10, 20, 30):
+                    shrink_ranges()
                 continue
 
-            # ACTIVE DESCENT to contact (or to deeper limit if no contact)
+            # Active descent
+            if ser:
+                try: ser.reset_input_buffer()
+                except Exception: pass
+
             ok, tcp_tgt, info = active_descend_to_contact(
                 rtde_c, rtde_r, base_tcp, point_tool,
                 start_point_z = hover_pointZ[2],
@@ -746,7 +1099,10 @@ def main():
                 no_contact_extra = NO_CONTACT_EXTRA_Z
             )
             if not ok:
-                print("Active descent failed — skipping logging for this pose.")
+                print("[SKIP] Active descent failed — skipping pose.")
+                consecutive_skips += 1
+                if consecutive_skips in (10, 20, 30):
+                    shrink_ranges()
                 continue
 
             # ---- Dwell & EIT read ----
@@ -756,14 +1112,14 @@ def main():
             time.sleep(DWELL)
             last_raw = read_eit_line(ser, EIT_TIMEOUT) if ser else ""
 
-            # ---- Log ----
+            # ---- Log successful pose ----
             actual_tcp = rtde_r.getActualTCPPose()
             wrench = rtde_r.getActualTCPForce() if LOG_WRENCH else [None]*6
 
             row = {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "session_id": session_id,
-                "index": idx,
+                "index": successful + 1,
                 "dx_m": float(dx), "dy_m": float(dy), "dz_m": float(dz),
                 "roll_deg": float(rdeg), "pitch_deg": float(pdeg), "yaw_deg": float(ydeg),
                 "contact_x_sel": x_sel,
@@ -787,21 +1143,17 @@ def main():
                 Fx,Fy,Fz,Tx,Ty,Tz = wrench
                 row.update({"Fx":Fx,"Fy":Fy,"Fz":Fz,"Tx":Tx,"Ty":Ty,"Tz":Tz})
 
-            if csv_f is None:
-                csv_f, csv_w, _ = open_csv_logger(LOG_CSV_PATH, include_wrench=LOG_WRENCH, eit_cols=eit_cols)
             csv_w.writerow(row); csv_f.flush()
+            successful += 1
+            consecutive_skips = 0
+            print(f"[SUCCESS] Logged pose {successful}/{RANDOM_SAMPLE_N}")
 
             # Rise back to hover (guards) at current XY/ori
-            back_hover = [base_tcp[0], base_tcp[1], info.get("z_final", planned_point_z) + HOVER_LIFT_Z,
+            back_hover = [base_tcp[0], base_tcp[1], info.get("z_final", planned_point_z) + max(HOVER_LIFT_Z, HOVER_LIFT_Z_MIN),
                           base_tcp[3], base_tcp[4], base_tcp[5]]
             safe_move_pointZ(rtde_c, rtde_r, back_hover, point_tool, SPEED, ACCEL)
 
-        print("Sequence complete. Returning to safe hover near current position.")
-        current_tcp = rtde_r.getActualTCPPose()
-        current_point_z = world_point_z_for_tcp_pose(current_tcp, (0.0, TOUCH_POINT_YZ[0], TOUCH_POINT_YZ[1]))
-        back_hover = [current_tcp[0], current_tcp[1], current_point_z + HOVER_LIFT_Z,
-                      current_tcp[3], current_tcp[4], current_tcp[5]]
-        safe_move_pointZ(rtde_c, rtde_r, back_hover, (0.0, TOUCH_POINT_YZ[0], TOUCH_POINT_YZ[1]), SPEED, ACCEL)
+        print(f"Sequence complete: {successful} successful poses out of {attempted} attempts.")
 
     finally:
         try: rtde_c.stopScript()
