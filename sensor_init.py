@@ -83,15 +83,15 @@ BASELINE_FRAMES          = 50     # build robust baseline at hover
 EMA_ALPHA                = 0.35   # low-pass for incoming frames
 PREFILT_MEDIAN_WINDOW    = 3      # rolling median window per channel
 TOP_K_PERCENT            = 20     # score uses median of top-K% channel z-scores
-WARN_SCORE               = 3.0    # warn threshold (robust z-score units)
-CONFIRM_SCORE            = 4.5    # confirm threshold
+WARN_SCORE               = 4.0    # warn threshold (robust z-score units)
+CONFIRM_SCORE            = 5.5    # confirm threshold
 DEBOUNCE_CONSEC          = 3      # consecutive frames >= confirm
 DZ_GUARD_ENABLE          = 0.003  # must descend at least this much from baseline (3 mm) before evaluating
 REFRACTORY_SEC           = 0.5    # lockout after contact
 
 # Optional force corroboration
-REQUIRE_FORCE_BUMP       = False
-FORCE_BUMP_N             = 2      # consecutive frames
+REQUIRE_FORCE_BUMP       = True
+FORCE_BUMP_N             = 3      # consecutive frames
 FORCE_BUMP_DELTA         = 3.0    # N in |Fz| increase (N)
 FORCE_ABS_MIN            = 5.0    # absolute |Fz| must be at least this much (N)
 
