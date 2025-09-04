@@ -3,14 +3,12 @@
 """
 UR5 EIT localizer — robust contact detection (MAD + hysteresis + gating)
 
-Key ideas:
-- Robust baseline per channel (median) with MAD scale.
-- Prefilter each EIT frame: EMA low-pass + rolling median.
-- Score = median of the top-K% per-channel robust z-scores.
-- Two-threshold hysteresis (WARN slows, CONFIRM stops) with consecutive-frame debounce.
-- Gating: require min downward travel from baseline before evaluating (prevents midair triggers).
-- Optional force corroboration to further reduce false positives.
-- Micro-step fallback near contact so speedStop has time to bite.
+This version integrates:
+- Robust CSV parsing for quoted EIT frames so eitb_* / eita_* log reliably.
+- Hardened detector (noise floor, channel masking, winsorized z) to prevent mid-air triggers.
+- 1s pause after contact before logging "after" EIT for settling.
+- Joint-limit avoidance while hovered (360° unwind opposite direction if near limits).
+- Auto-resume: on restart, reads existing CSV rows and resumes from the next pose.
 
 Requires: ur-rtde, pyserial
 """
@@ -39,9 +37,9 @@ DWELL = 1.0
 HOVER_LIFT_Z = 0.050
 EIT_BEFORE_DWELL = 0.30
 
-# Active descent (coarse)
+# Active descent (coarse / fine)
 DESCENT_SPEED   = 0.040
-DESCENT_ACCEL   = 0.200
+DESCENT_ACCEL   = 0.040
 STEP_Z_COARSE   = 0.0010     # 1.0 mm
 STEP_Z_FINE     = 0.00025    # 0.25 mm after WARN
 STEP_SETTLE     = 0.010
@@ -56,12 +54,13 @@ CLAMP_BELOW_FLOOR = False
 LOG_CSV_PATH = "eit_localisation_log.csv"
 LOG_WRENCH   = True
 LOG_EIT_RAW_STRINGS = False  # keep False to avoid “extra column” chaos in Excel
+POST_CONTACT_LOG_PAUSE = 1.0 # seconds to wait before sampling “after” EIT
 
 # EIT serial
 EIT_PORT = "/dev/ttyACM0"
 EIT_BAUD = 115200
 EIT_TIMEOUT = 0.2
-EIT_SNIFF_SECS = 2.0
+EIT_SNIFF_SECS = 5.0
 
 # Grid (meters & degrees)
 X_MIN, X_MAX, X_STEP = -0.020, +0.020, 0.001
@@ -76,24 +75,41 @@ SELECTION_MODE   = "RANDOM"   # or "ALL"
 RANDOM_SAMPLE_N  = 1500
 RANDOM_SEED      = 42
 
-# ------------------------- Robust EIT detection ------------------------ #
-# Tunables — start with these; tighten/loosen if still false positives.
+# Auto-resume
+AUTO_RESUME = True
 
-BASELINE_FRAMES          = 50     # build robust baseline at hover
-EMA_ALPHA                = 0.35   # low-pass for incoming frames
-PREFILT_MEDIAN_WINDOW    = 3      # rolling median window per channel
-TOP_K_PERCENT            = 20     # score uses median of top-K% channel z-scores
-WARN_SCORE               = 4.0    # warn threshold (robust z-score units)
-CONFIRM_SCORE            = 5.5    # confirm threshold
-DEBOUNCE_CONSEC          = 3      # consecutive frames >= confirm
-DZ_GUARD_ENABLE          = 0.003  # must descend at least this much from baseline (3 mm) before evaluating
-REFRACTORY_SEC           = 0.5    # lockout after contact
+# ------------------------- Robust EIT detection ------------------------ #
+# Thresholds per latest spec / noise-adaptive logic.
+
+BASELINE_FRAMES          = 50
+EMA_ALPHA                = 0.35
+PREFILT_MEDIAN_WINDOW    = 3
+TOP_K_PERCENT            = 20
+WARN_SCORE               = 4.0
+CONFIRM_SCORE            = 5.5
+DEBOUNCE_CONSEC          = 5
+DZ_GUARD_ENABLE          = 0.003
+REFRACTORY_SEC           = 0.5
+
+# --- EIT noise-floor & channel masking (prevents mid-air false positives) ---
+SCALE_ABS_FLOOR         = 0.02   # minimum per-channel scale (in raw EIT units)
+MAD_SCALE_PCTL_FLOOR    = 50     # use at least the p50 MAD across channels as the floor
+MIN_VALID_CHANS_RATIO   = 0.60   # require >=60% channels deemed "valid" to score
+Z_HUGE_CLIP             = 50.0   # winsorize extreme per-channel z before top-K/median
+
+# --- Noise-adaptive thresholding around hover ---
+HOVER_NOISE_FRAMES   = 80
+HOVER_NOISE_PCTL     = 95
+NOISE_MARGIN         = 1.0
+CONFIRM_EXTRA        = 0.75
+
+COARSE_WARN_CONSEC   = 2  # stable warn before fine stepping
 
 # Optional force corroboration
-REQUIRE_FORCE_BUMP       = True
-FORCE_BUMP_N             = 3      # consecutive frames
-FORCE_BUMP_DELTA         = 3.0    # N in |Fz| increase (N)
-FORCE_ABS_MIN            = 5.0    # absolute |Fz| must be at least this much (N)
+REQUIRE_FORCE_BUMP       = False
+FORCE_BUMP_N             = 3
+FORCE_BUMP_DELTA         = 10.0
+FORCE_ABS_MIN            = 10.0
 
 # ------------------------------ math utils ----------------------------- #
 
@@ -112,7 +128,7 @@ def rvec_to_rotmat(rvec):
     )
 
 def rpy_to_rotmat(roll, pitch, yaw):
-    cx, sx = math.cos(roll),  math.sin(roll)
+    cx, sx = math.cos(roll), math.sin(roll)
     cy, sy = math.cos(pitch), math.sin(pitch)
     cz, sz = math.cos(yaw),   math.sin(yaw)
     Rz = ((cz,-sz,0),(sz,cz,0),(0,0,1))
@@ -176,6 +192,69 @@ def safe_moveL(rtde_c, rtde_r, target, speed, accel):
 def add_z(pose, dz):
     return [pose[0], pose[1], pose[2] + dz, pose[3], pose[4], pose[5]]
 
+# ----------------------- Joint-limit avoidance ------------------------- #
+
+# Approximate UR5 joint hard limits (rad) – conservative
+JOINT_LIMITS = [
+    (-2*math.pi,  2*math.pi),   # base
+    (-2*math.pi,  2*math.pi),   # shoulder
+    (-2*math.pi,  2*math.pi),   # elbow
+    (-2*math.pi,  2*math.pi),   # wrist1
+    (-2*math.pi,  2*math.pi),   # wrist2
+    (-2*math.pi,  2*math.pi),   # wrist3
+]
+JOINT_MARGIN = 0.25            # rad; if closer than this to a limit, unwind 2π
+JOINT_UNWIND_SPEED = 0.7
+JOINT_UNWIND_ACCEL = 0.7
+
+def ensure_joint_margin(rtde_c, rtde_r):
+    """If any joint is too close to a limit, unwind 360° in the opposite direction while hovered."""
+    try:
+        q = list(rtde_r.getActualQ())
+    except Exception:
+        return
+    changed = False
+    q_cmd = q[:]
+    for i,(lo,hi) in enumerate(JOINT_LIMITS):
+        if (q[i] - lo) < JOINT_MARGIN:
+            q_cmd[i] = q[i] + 2*math.pi
+            changed = True
+        elif (hi - q[i]) < JOINT_MARGIN:
+            q_cmd[i] = q[i] - 2*math.pi
+            changed = True
+    if changed:
+        rtde_c.moveJ(q_cmd, JOINT_UNWIND_SPEED, JOINT_UNWIND_ACCEL)
+
+# --------------- Robust CSV parsing for quoted EIT frames -------------- #
+
+def _split_csv_fields(line: str):
+    """Robustly split a CSV line into fields, handling quotes and stray commas."""
+    if not line:
+        return []
+    try:
+        row = next(csv.reader([line]))
+    except Exception:
+        row = [tok.strip() for tok in line.strip().strip('"').split(",")]
+    while row and row[-1] == "":
+        row.pop()
+    return row
+
+def _to_float(s: str):
+    s = s.strip().strip('"').strip("'")
+    if s and s[0] in "[(" and s[-1] in "])":
+        s = s[1:-1]
+    return float(s)
+
+def parse_vec(line, buf):
+    fields = _split_csv_fields(line)
+    n = min(len(fields), len(buf))
+    try:
+        for i in range(n):
+            buf[i] = _to_float(fields[i])
+    except Exception:
+        return 0
+    return n
+
 # ----------------------- Async EIT (low-memory) ------------------------ #
 
 class AsyncEIT:
@@ -199,7 +278,8 @@ class AsyncEIT:
             s = line.decode("utf-8", "ignore").strip()
             if s: raw = s; break
         if raw:
-            self.cols = max(0, raw.count(",")+1)
+            fields = _split_csv_fields(raw)
+            self.cols = len(fields)
             with self.lock: self.last = raw
         self._th = threading.Thread(target=self._reader, daemon=True)
         self._th.start()
@@ -212,7 +292,7 @@ class AsyncEIT:
                 if not line: continue
                 s = line.decode("utf-8","ignore").strip()
                 if not s: continue
-                if self.cols==0 or (s.count(",")+1)==self.cols:
+                if self.cols == 0 or len(_split_csv_fields(s)) == self.cols:
                     lc = s
                     with self.lock: self.last = lc
             except Exception:
@@ -229,46 +309,28 @@ class AsyncEIT:
         except Exception:
             pass
 
-# ------------------------ EIT vector utilities ------------------------- #
-
-def parse_vec(line, buf):
-    """Parse CSV of floats into preallocated list 'buf'. Returns length (0 if fail)."""
-    if not line: return 0
-    i = 0; start = 0; L = len(line)
-    while start <= L:
-        j = line.find(",", start)
-        if j == -1: j = L
-        try:
-            buf[i] = float(line[start:j].strip())
-        except Exception:
-            return 0
-        i += 1
-        if i >= len(buf): break
-        start = j + 1
-        if j >= L: break
-    return i
-
 # ------------------------ Robust detector class ------------------------ #
 
 class RobustEITDetector:
     """
-    - Build baseline vector as per-channel MEDIAN over N frames.
-    - Scale per channel by MAD; z-score_i = |x_i - med_i| / (MAD_i * 1.4826 + eps)
-    - Prefilter: EMA + rolling median per channel.
-    - Score = median(top-K% z-scores).
-    - Hysteresis: WARN slows down; CONFIRM requires consecutive frames, gating by min dz.
+    - Baseline: per-channel MEDIAN; scale = max(1.4826*MAD, robust floor).
+    - Prefilter: EMA + rolling median.
+    - Score: median of top-K% robust z for VALID channels only (mask tiny-variance),
+             with winsorization at Z_HUGE_CLIP.
     """
     def __init__(self, cols):
         self.cols = cols
         self.baseline = [0.0]*cols
-        self.scale = [1.0]*cols
-        self.ema = [0.0]*cols
+        self.scale    = [1.0]*cols
+        self.ema      = [0.0]*cols
         self.med_bufs = [deque(maxlen=PREFILT_MEDIAN_WINDOW) for _ in range(cols)]
+        self.valid_idx = list(range(cols))
         self._ready = False
         self.last_confirm_t = 0.0
+        self.warn_eff = WARN_SCORE
+        self.confirm_eff = max(CONFIRM_SCORE, WARN_SCORE + CONFIRM_EXTRA)
 
     def build_baseline(self, eit, timeout_s=3.0):
-        # collect frames
         frames = []
         work = [0.0]*self.cols
         t0 = time.time()
@@ -278,24 +340,43 @@ class RobustEITDetector:
                 frames.append(list(work))
             time.sleep(0.005)
         if not frames:
-            # fall back to one sniff read
             self._ready = False
             return False
 
-        # median per channel
+        mads = []
         for k in range(self.cols):
             col = [f[k] for f in frames]
-            self.baseline[k] = statistics.median(col)
-            abs_dev = [abs(v - self.baseline[k]) for v in col]
+            med = statistics.median(col)
+            self.baseline[k] = med
+            abs_dev = [abs(v - med) for v in col]
             mad = statistics.median(abs_dev) if abs_dev else 0.0
-            self.scale[k] = max(1e-6, 1.4826*mad)  # 1.4826 makes MAD ~ std for Gaussian
-            self.ema[k] = self.baseline[k]  # start EMA at baseline
+            mads.append(mad)
+
+        # Robust floor from channel MAD distribution
+        nz = sorted([m for m in mads if m > 0.0])
+        p50 = statistics.median(nz) if nz else 0.0
+        scale_floor = max(1.4826 * max(p50, 0.0), SCALE_ABS_FLOOR)
+
+        self.valid_idx.clear()
+        for k, mad in enumerate(mads):
+            sc = max(1.4826*mad, scale_floor)
+            self.scale[k] = sc
+            self.ema[k] = self.baseline[k]
             self.med_bufs[k].clear()
+            if sc >= SCALE_ABS_FLOOR * 0.99:
+                self.valid_idx.append(k)
+
+        min_needed = int(self.cols * MIN_VALID_CHANS_RATIO)
+        if len(self.valid_idx) < min_needed:
+            print(f"[EIT] Too few valid channels ({len(self.valid_idx)}/{self.cols}); "
+                  f"check sensor/cabling or relax floors.")
+            self._ready = False
+            return False
+
         self._ready = True
         return True
 
     def prefilter(self, vec):
-        # Per-channel EMA + rolling median
         out = [0.0]*self.cols
         a = EMA_ALPHA
         for k in range(self.cols):
@@ -305,24 +386,54 @@ class RobustEITDetector:
         return out
 
     def score(self, vec):
-        # robust z-scores by channel
-        zs = [abs(vec[k] - self.baseline[k]) / self.scale[k] for k in range(self.cols)]
-        # take top-K% then median
+        if not self._ready or not self.valid_idx:
+            return 0.0
+        zs = []
+        for k in self.valid_idx:
+            z = abs(vec[k] - self.baseline[k]) / self.scale[k]
+            if z > Z_HUGE_CLIP:
+                z = Z_HUGE_CLIP
+            zs.append(z)
+        if not zs:
+            return 0.0
         K = max(1, int(len(zs) * TOP_K_PERCENT / 100.0))
-        zs_sorted = sorted(zs, reverse=True)[:K]
-        return statistics.median(zs_sorted)
+        K = min(K, len(zs))
+        return statistics.median(sorted(zs, reverse=True)[:K])
 
     def can_eval(self, dz_from_baseline):
-        # gating: only evaluate once we moved down meaningful distance
-        if dz_from_baseline is None:  # unknown => be conservative: don't eval
-            return False
-        return dz_from_baseline >= DZ_GUARD_ENABLE
+        return dz_from_baseline is not None and dz_from_baseline >= DZ_GUARD_ENABLE
 
     def refractory_ok(self):
         return (time.time() - self.last_confirm_t) >= REFRACTORY_SEC
 
     def mark_confirm(self):
         self.last_confirm_t = time.time()
+
+    def _score_of_latest(self, eit, work_vec):
+        line = eit.latest()
+        if parse_vec(line, work_vec) != self.cols:
+            return None
+        v = self.prefilter(work_vec)
+        return self.score(v)
+
+    def calibrate_hover_noise(self, eit, work_vec, max_time_s=2.0):
+        scores = []
+        t0 = time.time()
+        while len(scores) < HOVER_NOISE_FRAMES and (time.time() - t0) < max_time_s:
+            s = self._score_of_latest(eit, work_vec)
+            if s is not None:
+                scores.append(s)
+            time.sleep(0.005)
+        if not scores:
+            self.warn_eff = WARN_SCORE
+            self.confirm_eff = max(CONFIRM_SCORE, self.warn_eff + CONFIRM_EXTRA)
+            return False
+        ss = sorted(scores)
+        idx = int(round((HOVER_NOISE_PCTL/100.0) * (len(ss)-1)))
+        noise_pctl = ss[idx]
+        self.warn_eff = max(WARN_SCORE, noise_pctl + NOISE_MARGIN)
+        self.confirm_eff = max(CONFIRM_SCORE, self.warn_eff + CONFIRM_EXTRA)
+        return True
 
 # ---------------------- Range sampling (memory-safe) ------------------- #
 
@@ -357,29 +468,32 @@ def descend_until_contact(rtde_c, rtde_r, hover_pose, target_pose,
                           eit, cols, detector, work_vec, last_line_holder):
     """
     Hybrid descent:
-      1) coarse stepping until WARN threshold is hit (or we reach z_goal)
-      2) slow/fine stepping with short settle until CONFIRM hit (debounced)
+      1) coarse stepping until WARN threshold is stably hit
+      2) fine stepping with short settle until CONFIRM hit (debounced; optional force)
     Returns (contact_detected, final_pose, steps_taken)
     """
     zmin_allowed = MIN_BASE_Z + FLOOR_MARGIN
     z_goal = max(target_pose[2] - NO_CONTACT_EXTRA_Z, zmin_allowed)
 
-    # Track z at baseline hover to gate evaluation
-    baseline_pose = rtde_r.getActualTCPPose()
-    z_baseline = baseline_pose[2]
+    z_baseline = rtde_r.getActualTCPPose()[2]
 
-    # Coarse stage
+    warn_thr = getattr(detector, "warn_eff", WARN_SCORE)
+    conf_thr = getattr(detector, "confirm_eff", CONFIRM_SCORE)
+
     z = hover_pose[2]
     steps = 0
-    consec = 0
     warn_mode = False
+    warn_consec = 0
+    confirm_consec = 0
     contact = False
-    last_scores = deque(maxlen=10)
+
+    score_hist = deque(maxlen=12)
+    fz_hist    = deque(maxlen=20)
+    last_line_holder[0] = ""
 
     p_step = list(target_pose)
-    p_step[0:3] = [target_pose[0], target_pose[1], z]  # start at hover z
+    p_step[0:3] = [target_pose[0], target_pose[1], z]
 
-    # Helper to take one measurement + score
     def measure_score():
         line = eit.latest() if eit else ""
         if parse_vec(line, work_vec) != cols:
@@ -387,10 +501,20 @@ def descend_until_contact(rtde_c, rtde_r, hover_pose, target_pose,
         v = detector.prefilter(work_vec)
         s = detector.score(v)
         last_line_holder[0] = line
-        last_scores.append(s)
+        score_hist.append(s)
         return s
 
-    # Coarse stepping down
+    def update_force_and_check_bump():
+        Fx, Fy, Fz, Tx, Ty, Tz = rtde_r.getActualTCPForce()
+        afz = abs(Fz)
+        fz_hist.append(afz)
+        if len(fz_hist) < FORCE_BUMP_N + 2:
+            return False
+        recent = list(fz_hist)[-FORCE_BUMP_N:]
+        prev_med = statistics.median(list(fz_hist)[:-FORCE_BUMP_N])
+        return (max(recent) - prev_med) >= FORCE_BUMP_DELTA and max(recent) >= FORCE_ABS_MIN
+
+    # Coarse stepping
     while z - STEP_Z_COARSE >= z_goal - 1e-12:
         z -= STEP_Z_COARSE
         p_step[2] = z
@@ -400,21 +524,24 @@ def descend_until_contact(rtde_c, rtde_r, hover_pose, target_pose,
         steps += 1
         time.sleep(STEP_SETTLE)
 
-        # Only evaluate after we moved enough since baseline hover
         dz_from_baseline = z_baseline - z
         if detector.can_eval(dz_from_baseline) and detector.refractory_ok():
             s = measure_score()
-            if s is not None and s >= WARN_SCORE:
-                warn_mode = True
-                print(f"[WARN] at z={z:.4f} score={s:.3f} -> switching to fine steps")
-                break
+            if s is not None and s >= warn_thr:
+                warn_consec += 1
+                if warn_consec >= COARSE_WARN_CONSEC:
+                    print(f"[WARN] at z={z:.4f} score={s:.3f} -> switching to fine steps")
+                    warn_mode = True
+                    break
+            else:
+                warn_consec = 0
 
-    # Fine stage
+    # Fine stepping
     if warn_mode and z - STEP_Z_FINE >= z_goal - 1e-12:
+        force_bump_consec = 0
         while z - STEP_Z_FINE >= z_goal - 1e-12:
             z -= STEP_Z_FINE
             p_step[2] = z
-            # micro step with slower speed
             if not safe_moveL(rtde_c, rtde_r, p_step, DESCENT_SPEED*0.5, DESCENT_ACCEL*0.5):
                 print(f"[DESCENT] fine moveL failed at z={z:.4f}")
                 break
@@ -422,44 +549,56 @@ def descend_until_contact(rtde_c, rtde_r, hover_pose, target_pose,
             time.sleep(max(0.005, STEP_SETTLE*0.5))
 
             dz_from_baseline = z_baseline - z
-            if detector.can_eval(dz_from_baseline) and detector.refractory_ok():
-                s = measure_score()
-                if s is None:
-                    consec = 0
-                    continue
+            if not (detector.can_eval(dz_from_baseline) and detector.refractory_ok()):
+                confirm_consec = 0
+                force_bump_consec = 0
+                continue
 
-                # Optional force corroboration
-                force_ok = True
-                if REQUIRE_FORCE_BUMP:
-                    Fx,Fy,Fz,Tx,Ty,Tz = rtde_r.getActualTCPForce()
-                    # crude bump check vs recent history of Fz
-                    # keep last few Fz in the deque via last_scores length
-                    if abs(Fz) < FORCE_ABS_MIN:
-                        force_ok = False
+            s = measure_score()
+            if s is None:
+                confirm_consec = 0
+                force_bump_consec = 0
+                continue
 
-                if s >= CONFIRM_SCORE and force_ok:
-                    consec += 1
+            force_ok = True
+            if REQUIRE_FORCE_BUMP:
+                if update_force_and_check_bump():
+                    force_bump_consec += 1
                 else:
-                    consec = 0
+                    force_bump_consec = 0
+                force_ok = (force_bump_consec >= FORCE_BUMP_N)
 
-                if consec >= DEBOUNCE_CONSEC:
-                    contact = True
-                    detector.mark_confirm()
-                    print(f"[CONTACT] at z={z:.4f} (score={s:.6f})")
-                    break
+            if s >= conf_thr and force_ok:
+                confirm_consec += 1
+            else:
+                confirm_consec = 0
 
-    # Final pose = current command (safe; settle and read actual)
+            if confirm_consec >= DEBOUNCE_CONSEC:
+                contact = True
+                detector.mark_confirm()
+                print(f"[CONTACT] at z={z:.4f} (score={s:.6f})")
+                break
+
     final_pose = list(target_pose)
     final_pose[2] = z
-    # hard stop to be safe (in case we’ll log & go hover)
+
     try:
         rtde_c.speedStop()
     except Exception:
         pass
     time.sleep(0.02)
+
     return contact, final_pose, steps
 
 # ------------------------------- Main --------------------------------- #
+
+def _count_completed_rows(csv_path):
+    if not os.path.exists(csv_path):
+        return 0
+    with open(csv_path, "r", newline="") as f:
+        # Count non-empty lines minus header
+        n = sum(1 for _ in f)
+    return max(0, n - 1)
 
 def main():
     random.seed(RANDOM_SEED)
@@ -495,6 +634,9 @@ def main():
             print("Cannot reach start hover; exiting.")
             return
 
+        # Make sure we are not near joint limits before starting grid
+        ensure_joint_margin(rtde_c, rtde_r)
+
         # Axes
         ax = UniformGrid1D(X_MIN, X_MAX, X_STEP)
         ay = UniformGrid1D(Y_MIN, Y_MAX, Y_STEP)
@@ -512,11 +654,12 @@ def main():
             stream_all = True
         else:
             k = min(RANDOM_SAMPLE_N, total)
+            # Deterministic order (seed) → resume works
             selected_indices = random.sample(range(total), k)
             stream_all = False
             print(f"[GRID] Randomly selected {k} poses (seed={RANDOM_SEED}).")
 
-        # CSV
+        # CSV setup
         exists = os.path.exists(LOG_CSV_PATH)
         csv_f = open(LOG_CSV_PATH, "a", newline="")
         base_fields = [
@@ -535,6 +678,14 @@ def main():
         writer = csv.DictWriter(csv_f, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
         if not exists:
             writer.writeheader(); csv_f.flush()
+
+        # Auto-resume: figure out starting index based on completed rows
+        start_index_in_log = 1
+        if AUTO_RESUME:
+            done_rows = _count_completed_rows(LOG_CSV_PATH)
+            if done_rows > 0:
+                start_index_in_log = done_rows + 1
+                print(f"[RESUME] Found {done_rows} completed rows. Resuming at index {start_index_in_log}.")
 
         session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -555,9 +706,7 @@ def main():
                 if s: eit_raw_before = s
                 time.sleep(0.01)
             if detector.build_baseline(eit, timeout_s=5.0):
-                # stash baseline snapshot for logging “eitb_*”
-                if parse_vec(eit_raw_before, baseline) != eit_cols:
-                    # if parse fails, keep detector.baseline
+                if parse_vec(eit_raw_before, baseline) < eit_cols:
                     for i in range(eit_cols):
                         baseline[i] = detector.baseline[i]
                 print("[EIT] Baseline ready.")
@@ -583,6 +732,9 @@ def main():
             if not safe_moveL(rtde_c, rtde_r, target_hover, SPEED, ACCEL):
                 return False, None
 
+            # Avoid joint limits while hovered
+            ensure_joint_margin(rtde_c, rtde_r)
+
             # Rebuild baseline each pose (robust against slow drift)
             eit_raw_before = ""
             if detector:
@@ -592,6 +744,8 @@ def main():
                     if s: eit_raw_before = s
                     time.sleep(0.01)
                 detector.build_baseline(eit, timeout_s=3.0)
+                detector.calibrate_hover_noise(eit, work_vec, max_time_s=2.0)
+                print(f"[THR] WARN_EFF={detector.warn_eff:.2f}, CONFIRM_EFF={detector.confirm_eff:.2f}")
 
             # Descent
             contact = False; steps_taken=0; eit_raw_after=""
@@ -601,7 +755,12 @@ def main():
                     rtde_c, rtde_r, target_hover, target,
                     eit, eit_cols, detector, work_vec, last_line_holder
                 )
-                eit_raw_after = last_line_holder[0]
+                # pause to let EIT settle for logging only
+                if contact:
+                    time.sleep(POST_CONTACT_LOG_PAUSE)
+                    eit_raw_after = eit.latest() if eit else ""
+                else:
+                    eit_raw_after = eit.latest() if eit else ""
             else:
                 if not safe_moveL(rtde_c, rtde_r, target, SPEED, ACCEL):
                     return False, None
@@ -631,12 +790,16 @@ def main():
                 row["eit_raw_after"]  = eit_raw_after
 
             if eit_cols:
-                # store the *baseline* snapshot and post-contact vecs for offline plots
-                if parse_vec(eit_raw_before, work_vec) == eit_cols:
+                # baseline snapshot → eitb_*
+                if parse_vec(eit_raw_before, work_vec) >= eit_cols:
                     for i in range(eit_cols): row[f"eitb_{i}"] = work_vec[i]
                 else:
-                    for i in range(eit_cols): row[f"eitb_{i}"] = ""
-                if parse_vec(eit_raw_after, work_vec) == eit_cols:
+                    if detector:
+                        for i in range(eit_cols): row[f"eitb_{i}"] = detector.baseline[i]
+                    else:
+                        for i in range(eit_cols): row[f"eitb_{i}"] = ""
+                # post-contact snapshot → eita_*
+                if parse_vec(eit_raw_after, work_vec) >= eit_cols:
                     for i in range(eit_cols): row[f"eita_{i}"] = work_vec[i]
                 else:
                     for i in range(eit_cols): row[f"eita_{i}"] = ""
@@ -647,15 +810,32 @@ def main():
 
             writer.writerow(row); csv_f.flush()
 
-            # back to hover
+            # back to hover for next pose
             if not safe_moveL(rtde_c, rtde_r, target_hover, SPEED, ACCEL):
                 return False, None
             return True, final_pose
 
+        # Iteration logic with resume
         if stream_all:
+            # Mixed-radix counter
             idxs = [0,0,0,0,0,0]
             limits = [a.count for a in axes]
             linear = 0
+
+            # Fast-forward if resuming
+            if AUTO_RESUME and start_index_in_log > 1:
+                skip = start_index_in_log - 1
+                linear = skip
+                # decode the (skip)th index in lexicographic order
+                # by iterating counters skip times (cheap enough), or compute directly:
+                # We'll increment counters skip times (safe & simple).
+                for _ in range(skip):
+                    for d in range(5, -1, -1):
+                        idxs[d] += 1
+                        if idxs[d] < limits[d]:
+                            break
+                        idxs[d] = 0
+
             while True:
                 deltas, target = pose_from_indices(idxs)
                 ok, _ = do_one_pose(linear+1, target, deltas)
@@ -668,10 +848,15 @@ def main():
                 else:
                     break
         else:
+            # Random subset in deterministic order; resume by skipping done rows
+            start_j = start_index_in_log
+            total_sel = len(selected_indices)
             for j, lin in enumerate(selected_indices, start=1):
+                if j < start_j:
+                    continue  # skip done
                 idxs = decode_linear_index(lin, axes)
                 deltas, target = pose_from_indices(idxs)
-                print(f"[{j}/{len(selected_indices)}] target: "
+                print(f"[{j}/{total_sel}] target: "
                       f"{[round(v,6) for v in target]} (dx={deltas[0]},dy={deltas[1]},dz={deltas[2]},r={deltas[3]},p={deltas[4]},y={deltas[5]})")
                 ok, _ = do_one_pose(j, target, deltas)
                 if not ok: break
