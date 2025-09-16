@@ -190,3 +190,28 @@ class MaestroWiFiClient:
         rid = self._next_req_id()
         self._send_line(f"PING id={rid}")
         return self._wait_for_id(rid, timeout)
+
+    # --- new convenience ops that hit the new firmware commands ---
+    def set_speed(self, ch: int, value: int, timeout: float = 1.0) -> str:
+        rid = self._next_req_id()
+        self._send_line(f"SPEED {ch} {value} id={rid}")
+        return self._wait_for_id(rid, timeout)
+
+    def set_accel(self, ch: int, value: int, timeout: float = 1.0) -> str:
+        rid = self._next_req_id()
+        self._send_line(f"ACCEL {ch} {value} id={rid}")
+        return self._wait_for_id(rid, timeout)
+
+    def run_script(self, sub: int, param: int | None = None, timeout: float = 1.0) -> str:
+        rid = self._next_req_id()
+        if param is None:
+            self._send_line(f"RUN {sub} id={rid}")
+        else:
+            self._send_line(f"RUN {sub} {param} id={rid}")
+        return self._wait_for_id(rid, timeout)
+
+    def stop_script(self, timeout: float = 1.0) -> str:
+        rid = self._next_req_id()
+        self._send_line(f"STOPSCRIPT id={rid}")
+        return self._wait_for_id(rid, timeout)
+
