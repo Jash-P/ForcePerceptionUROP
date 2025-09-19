@@ -1,0 +1,17 @@
+{
+  "created_utc": "2025-09-15T13:48:14.350466Z",
+  "csv_path": "/home/jash/Documents/ForcePerceptionUROP/data/eit_localisation_log.csv",
+  "rows_final": 1169,
+  "test_size_groups": 0.2,
+  "cv_folds": 5,
+  "grouping": "xyz",
+  "best_model": "pls",
+  "best_hparams": {
+    "n_components": 8,
+    "pca_var": 0.98
+  },
+  "cv_vector_RMSE_m": 0.015150444210566157,
+  "bag_models": 5,
+  "per_session_norm": true,
+  "min_deit_pct": null
+}

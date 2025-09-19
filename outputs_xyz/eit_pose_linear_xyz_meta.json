@@ -1,0 +1,10 @@
+{
+  "created_utc": "2025-09-15T12:16:58.321070Z",
+  "csv_path": "/home/jash/Documents/ForcePerceptionUROP/data/eit_localisation_log.csv",
+  "rows_after_Fz": 1169,
+  "test_size_groups": 0.2,
+  "cv_folds": 5,
+  "best_alpha": 100.0,
+  "vector_RMSE_cv_m": 0.014031809754669666,
+  "notes": "Linear Ridge model optimized for XYZ only (\u0394EIT features)."
+}

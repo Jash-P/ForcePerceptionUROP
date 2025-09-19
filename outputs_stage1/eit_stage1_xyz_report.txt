@@ -1,0 +1,12 @@
+Stage-1: ΔEIT → XYZ (Ridge/PLS), grouped CV + bagging
+Date (UTC): 2025-09-15T13:48:14.350466Z
+CSV: /home/jash/Documents/ForcePerceptionUROP/data/eit_localisation_log.csv
+Samples: train+val=938 | test=231 | total=1169
+Grouping: xyz   CV folds: 5   Bag models: 5
+Best model: pls  hparams: {'n_components': 8, 'pca_var': 0.98}  (CV vector RMSE=0.015150 m)
+
+[Test] XYZ metrics
+Vector RMSE = 0.014320 m   Vector MAE = 0.012415 m
+  act_tcp_x  RMSE=0.009418 m   MAE=0.006986 m
+  act_tcp_y  RMSE=0.010021 m   MAE=0.007823 m
+  act_tcp_z  RMSE=0.003995 m   MAE=0.003134 m

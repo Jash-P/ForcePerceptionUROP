@@ -6,11 +6,13 @@ UR5 + EIT with sensor_init.py-grade contact detection:
 - RobustEITDetector (MAD-scale, EMA + median prefilter, top-K robust z, winsorization)
 - Coarse→fine guarded descent (warn→confirm with debounce, refractory, DZ guard, optional force bump)
 - 1s pause after contact before sampling "after" EIT
+
 Then:
   • Build ΔEIT[256] at contact vs hover
   • Run stage1 ensemble to infer XYZ
-  • Move by (desired - predicted): XY at hover, absolute Z to goal
-  • Report final pose error and log a row
+  • Move to a NEW XYZ (SECOND_CONTACT_XYZ) at a new orientation (relative to first-contact orientation)
+  • Then continuously move along -Y until contact is detected (same robust gating)
+  • Report final pose error vs SECOND_CONTACT_XYZ and log a row
 
 Requires: ur-rtde, pyserial, numpy, joblib
 """
@@ -66,23 +68,39 @@ EIT_SNIFF_SECS = 5.0
 ENSEMBLE_PATH = "./outputs_stage1_tuned/eit_stage1_xyz_ensemble.joblib"
 DELTA_EIT_DIM = 256
 
-# Desired contact (base frame)
-DESIRED_XYZ = [-0.030, -0.500, 0.200]   # meters
+# --- Initial desired for the FIRST contact (where we do the Z descent) ---
+DESIRED_XYZ = [-0.006, -0.493, -0.222+0.350]   # meters
 
-# Initial randomization around desired XY (±range in meters)
-RAND_INIT_X_RANGE = 0.030   # ±30 mm
-RAND_INIT_Y_RANGE = 0.030   # ±30 mm
+# --- NEW: absolute XYZ for the SECOND contact (Y-scan target base point) ---
+SECOND_CONTACT_XYZ = [-0.030, -0.503, -0.215+0.350]   # <— set this to the new target
 
-# Orientation choice
+# Initial randomization around initial desired XY (±range in meters)
+RAND_INIT_X_RANGE = 0.030
+RAND_INIT_Y_RANGE = 0.030
+
+# Start-Z offset relative to the first target Z
+START_Z_OFFSET = 0.100
+
+# Orientation choice for *start*
 USE_CURRENT_ORIENT   = False
-EXPLICIT_START_POSE  = [-0.030, -0.500, 0.200, 0.50, -1.50, 0.66]  # use only [3:6]
+EXPLICIT_START_POSE  = [-0.030, -0.500, 0.200, 0.47, -1.50, 0.65]  # use only [3:6]
+
+# Orientation change (relative) for the move-to-new-XYZ stage (relative to first-contact orientation)
+def deg2rad(d): return d * math.pi / 180.0
+REL_ORIENT_DELTA = [-deg2rad(45), -deg2rad(90), 0.0]
+
+# Continuous Y-scan (after moving to new pose) — params
+YSCAN_SPEED       = 0.010   # m/s along -Y (positive number; we command -Y)
+YSCAN_CMD_DT      = 0.20    # s per segment
+YSCAN_STOP_RAMP   = 0.20    # s decel ramp
+YSCAN_MAX_TRAVEL  = 0.050   # m max travel along -Y if no contact
+PATH_GUARD_ENABLE = 0.003   # minimum travel before evaluating EIT thresholds
 
 # Logging
 LOG_CSV_PATH = "eit_infer_xyz_randomstart_runlog.csv"
 LOG_WRENCH   = True
 
 # ------------------------- Robust EIT detection ------------------------ #
-# (Copied 1:1 from your sensor_init.py)
 
 BASELINE_FRAMES          = 50
 EMA_ALPHA                = 0.35
@@ -112,8 +130,6 @@ FORCE_BUMP_DELTA         = 10.0
 FORCE_ABS_MIN            = 10.0
 
 # ------------------------------ math utils ----------------------------- #
-
-def deg2rad(d): return d * math.pi / 180.0
 
 def rvec_to_rotmat(rvec):
     rx, ry, rz = rvec
@@ -324,8 +340,8 @@ class RobustEITDetector:
         K = min(K, len(zs))
         return statistics.median(sorted(zs, reverse=True)[:K])
 
-    def can_eval(self, dz_from_baseline):
-        return dz_from_baseline is not None and dz_from_baseline >= DZ_GUARD_ENABLE
+    def can_eval(self, path_travel):
+        return path_travel is not None and path_travel >= max(DZ_GUARD_ENABLE, PATH_GUARD_ENABLE)
 
     def refractory_ok(self):
         return (time.time() - self.last_confirm_t) >= REFRACTORY_SEC
@@ -354,16 +370,10 @@ class RobustEITDetector:
         self.confirm_eff = max(CONFIRM_SCORE, self.warn_eff + CONFIRM_EXTRA)
         return True
 
-# -------------------------- Guarded descent ---------------------------- #
+# -------------------------- Guarded descent (Z) ------------------------ #
 
 def descend_until_contact(rtde_c, rtde_r, hover_pose, target_pose,
                           eit, cols, detector, work_vec):
-    """
-    Hybrid descent (mirrors sensor_init.py):
-      1) coarse stepping until WARN reached stably
-      2) fine stepping until CONFIRM reached (debounced)
-    Returns (contact_detected, final_pose_z)
-    """
     zmin_allowed = MIN_BASE_Z + FLOOR_MARGIN
     z_goal = max(target_pose[2] - NO_CONTACT_EXTRA_Z, zmin_allowed)
     z_baseline = rtde_r.getActualTCPPose()[2]
@@ -396,8 +406,8 @@ def descend_until_contact(rtde_c, rtde_r, hover_pose, target_pose,
             break
         time.sleep(STEP_SETTLE)
 
-        dz_from_baseline = z_baseline - z
-        if detector.can_eval(dz_from_baseline) and detector.refractory_ok():
+        path_travel = z_baseline - z
+        if detector.can_eval(path_travel) and detector.refractory_ok():
             s = measure_score()
             if s is not None and s >= warn_thr:
                 warn_consec += 1
@@ -418,8 +428,8 @@ def descend_until_contact(rtde_c, rtde_r, hover_pose, target_pose,
                 break
             time.sleep(max(0.005, STEP_SETTLE*0.5))
 
-            dz_from_baseline = z_baseline - z
-            if not (detector.can_eval(dz_from_baseline) and detector.refractory_ok()):
+            path_travel = z_baseline - z
+            if not (detector.can_eval(path_travel) and detector.refractory_ok()):
                 confirm_consec = 0
                 continue
 
@@ -443,6 +453,68 @@ def descend_until_contact(rtde_c, rtde_r, hover_pose, target_pose,
     final_pose[2] = z
     return contact, final_pose
 
+# --------------- Continuous move along -Y until contact ---------------- #
+
+def _sample_motion_window(eit, work_vec, detector):
+    line = eit.latest()
+    if parse_vec_into(line, work_vec) != detector.cols:
+        return None
+    v = detector.prefilter(work_vec)
+    return detector.score(v)
+
+def continuous_move_y_until_contact(rtde_c, rtde_r, start_pose, target_pose_same_xz,
+                                    eit, detector, work_vec,
+                                    y_speed=YSCAN_SPEED, cmd_dt=YSCAN_CMD_DT,
+                                    stop_ramp=YSCAN_STOP_RAMP):
+    # enforce same x,z,rx,ry,rz
+    for k in (0,2,3,4,5):
+        assert abs(start_pose[k]-target_pose_same_xz[k]) < 1e-9
+
+    y_start  = start_pose[1]
+    y_goal   = target_pose_same_xz[1]  # typically y_start - YSCAN_MAX_TRAVEL
+    vy_cmd   = [0.0, -abs(y_speed), 0.0, 0.0, 0.0, 0.0]
+    confirm  = 0
+    contact  = False
+
+    try:
+        while True:
+            pose = rtde_r.getActualTCPPose()
+            ynow = pose[1]
+
+            if ynow <= y_goal + 1e-6:
+                break
+
+            rtde_c.speedL(vy_cmd, ACCEL, cmd_dt)
+
+            s = _sample_motion_window(eit, work_vec, detector)
+            if s is None:
+                time.sleep(0.01)
+                continue
+
+            path_travel = y_start - ynow  # positive as we go -Y
+            if detector.can_eval(path_travel) and detector.refractory_ok():
+                if s >= detector.confirm_eff:
+                    confirm += 1
+                else:
+                    confirm = 0
+                if confirm >= DEBOUNCE_CONSEC:
+                    contact = True
+                    detector.mark_confirm()
+                    print(f"[Y-CONTACT] at y={ynow:.4f} (score={s:.6f})")
+                    break
+
+            time.sleep(0.01)
+
+    finally:
+        try:
+            rtde_c.speedStop(stop_ramp)
+        except Exception:
+            pass
+        time.sleep(stop_ramp + 0.02)
+
+    reached_pose = list(rtde_r.getActualTCPPose())
+    return contact, reached_pose
+
 # --------------------------- Small helpers ----------------------------- #
 
 def auto_pick_port():
@@ -457,7 +529,8 @@ def to_len(vec, n, pad=0.0):
 def open_csv_logger(path, include_wrench=True, dim=None):
     fields = [
         "timestamp","session_id",
-        "desired_x","desired_y","desired_z",
+        "desired_x","desired_y","desired_z",           # first-contact target (for context)
+        "second_target_x","second_target_y","second_target_z",  # NEW: second-contact target we aim for
         "start_x","start_y","start_z","start_rx","start_ry","start_rz",
         "contact_x","contact_y","contact_z",
         "pred_x","pred_y","pred_z",
@@ -516,8 +589,9 @@ def main():
         return
 
     desired_x, desired_y, desired_z = DESIRED_XYZ
+    second_x, second_y, second_z    = SECOND_CONTACT_XYZ
 
-    # Initial pose: random XY around desired; orientation choice
+    # Initial pose: random XY around FIRST desired; orientation choice
     if USE_CURRENT_ORIENT:
         rx, ry, rz = rtde_r.getActualTCPPose()[3:6]
     else:
@@ -525,19 +599,17 @@ def main():
 
     start_x = desired_x + random.uniform(-RAND_INIT_X_RANGE, +RAND_INIT_X_RANGE)
     start_y = desired_y + random.uniform(-RAND_INIT_Y_RANGE, +RAND_INIT_Y_RANGE)
-    start_z = desired_z
+    start_z = desired_z + START_Z_OFFSET
     start_pose = [start_x, start_y, start_z, rx, ry, rz]
 
-    # Move to hover
+    # Move to hover and baseline
     start_hover = add_z(start_pose, HOVER_LIFT_Z)
     print("Start pose :", [round(v,6) for v in start_pose])
     if not safe_moveL(rtde_c, rtde_r, start_hover, SPEED, ACCEL):
         print("Cannot reach start hover; exiting.")
         return
 
-    # Build detector baseline + calibrate noise at hover
     detector = RobustEITDetector(eit_cols)
-    # dwell to sniff a raw "before" line
     eit_raw_before = ""
     tbh = time.time() + EIT_BEFORE_DWELL
     while time.time() < tbh:
@@ -552,13 +624,13 @@ def main():
     detector.calibrate_hover_noise(eit, work_vec, max_time_s=2.0)
     print(f"[THR] WARN_EFF={detector.warn_eff:.2f}, CONFIRM_EFF={detector.confirm_eff:.2f}")
 
-    # Guarded descent to contact (coarse→fine)
+    # Guarded Z descent to FIRST contact
     contact, contact_pose = descend_until_contact(
         rtde_c, rtde_r, start_hover, start_pose,
         eit, eit_cols, detector, work_vec
     )
 
-    # Pause before "after" logging (mirrors sensor_init.py)
+    # Pause before "after" logging
     time.sleep(POST_CONTACT_LOG_PAUSE)
     eit_raw_after = eit.latest() or ""
 
@@ -566,16 +638,15 @@ def main():
     vb = [0.0]*eit_cols
     va = [0.0]*eit_cols
     if parse_vec_into(eit_raw_before, vb) < eit_cols:
-        # fallback to detector baseline (robust)
         vb = list(detector.baseline)
     else:
         vb = list(vb)
     if parse_vec_into(eit_raw_after, va) < eit_cols:
-        va = vb[:]  # worst-case: no delta
+        va = vb[:]
     else:
         va = list(va)
 
-    # ΔEIT[256] shaping
+    # ΔEIT[256]
     vb256 = to_len(vb, DELTA_EIT_DIM, 0.0)
     va256 = to_len(va, DELTA_EIT_DIM, 0.0)
     delta = [va256[i]-vb256[i] for i in range(DELTA_EIT_DIM)]
@@ -586,55 +657,73 @@ def main():
     pred_x, pred_y, pred_z = map(float, pred_xyz[0])
     print(f"[PRED] xyz = {pred_x:.4f}, {pred_y:.4f}, {pred_z:.4f}")
 
-    # Move by (desired - predicted): rise, XY at hover, absolute Z
-    dx = desired_x - pred_x
-    dy = desired_y - pred_y
-    print(f"[MOVE] delta_xy = ({dx:+.4f}, {dy:+.4f}) m; target_z_abs = {desired_z:.4f} m")
+    # --- Move to NEW absolute XYZ (SECOND_CONTACT_XYZ) with NEW orientation (relative to contact) ---
+    dx = second_x - pred_x
+    dy = second_y - pred_y
+    dz = second_z - pred_z
+    print(f"[MOVE] delta_xyz_to_second = ({dx:+.4f}, {dy:+.4f}, {dz:+.4f}) m; REL_ORIENT_DELTA={REL_ORIENT_DELTA}")
 
+    # Rise from first contact
     up_from_contact = add_z(contact_pose, HOVER_LIFT_Z)
     safe_moveL(rtde_c, rtde_r, up_from_contact, SPEED, ACCEL)
 
-    hover_to_goal_xy = [
-        up_from_contact[0] + dx,
-        up_from_contact[1] + dy,
-        up_from_contact[2],
-        contact_pose[3], contact_pose[4], contact_pose[5]
+    # New orientation = contact orientation + REL_ORIENT_DELTA
+    new_rx = contact_pose[3] + REL_ORIENT_DELTA[0]
+    new_ry = contact_pose[4] + REL_ORIENT_DELTA[1]
+    new_rz = contact_pose[5] + REL_ORIENT_DELTA[2]
+
+    # Hover over SECOND_CONTACT_XYZ with new orientation (apply model correction via dx,dy,dz at hover Z)
+    new_hover_pose = [
+        up_from_contact[0] + dx,   # shift X by correction
+        up_from_contact[1] + dy,   # shift Y by correction (we'll still scan along -Y from here)
+        second_z + HOVER_LIFT_Z,   # absolute Z at hover height above SECOND_CONTACT_Z
+        new_rx, new_ry, new_rz
     ]
-    if not safe_moveL(rtde_c, rtde_r, hover_to_goal_xy, SPEED, ACCEL):
-        print("[MOVE] Could not move to hover over desired XY.")
+    if not safe_moveL(rtde_c, rtde_r, new_hover_pose, SPEED, ACCEL):
+        print("[MOVE] Could not move to new hover @ SECOND_CONTACT_XYZ with new orientation.")
         final_pose = rtde_r.getActualTCPPose()
     else:
-        goal_at_z = [
-            hover_to_goal_xy[0],
-            hover_to_goal_xy[1],
-            DESIRED_XYZ[2],  # absolute Z
-            contact_pose[3], contact_pose[4], contact_pose[5]
-        ]
-        if not safe_moveL(rtde_c, rtde_r, goal_at_z, SPEED, ACCEL):
-            print("[MOVE] Could not move to absolute desired Z.")
-        time.sleep(0.25)
-        final_pose = rtde_r.getActualTCPPose()
+        # Re-baseline at this new hover before the Y scan
+        if not detector.build_baseline(eit, timeout_s=3.0):
+            print("[EIT] Baseline (pre-Yscan) failed; holding position and skipping Y scan.")
+            final_pose = rtde_r.getActualTCPPose()
+        else:
+            detector.calibrate_hover_noise(eit, work_vec, max_time_s=2.0)
+            print(f"[THR-Y] WARN_EFF={detector.warn_eff:.2f}, CONFIRM_EFF={detector.confirm_eff:.2f}")
 
-    # Report error
-    err_x = final_pose[0] - desired_x
-    err_y = final_pose[1] - desired_y
-    err_z = final_pose[2] - desired_z
+            # Define -Y scan goal from current hover (limit by YSCAN_MAX_TRAVEL)
+            current_hover = list(rtde_r.getActualTCPPose())
+            y_goal = current_hover[1] - abs(YSCAN_MAX_TRAVEL)
+            y_target_pose = [current_hover[0], y_goal, current_hover[2], new_rx, new_ry, new_rz]
+
+            y_contact, y_pose = continuous_move_y_until_contact(
+                rtde_c, rtde_r, current_hover, y_target_pose,
+                eit, detector, work_vec,
+                y_speed=YSCAN_SPEED, cmd_dt=YSCAN_CMD_DT, stop_ramp=YSCAN_STOP_RAMP
+            )
+            final_pose = y_pose
+
+    # Report error vs SECOND_CONTACT_XYZ
+    err_x = final_pose[0] - second_x
+    err_y = final_pose[1] - second_y
+    err_z = final_pose[2] - second_z
     print(f"[RESULT] Final position:  x={final_pose[0]:.4f}, y={final_pose[1]:.4f}, z={final_pose[2]:.4f}")
-    print(f"[RESULT] Desired target:  x={desired_x:.4f}, y={desired_y:.4f}, z={desired_z:.4f}")
+    print(f"[RESULT] Second target :  x={second_x:.4f}, y={second_y:.4f}, z={second_z:.4f}")
     print(f"[ERROR ] Pose error:      dx={err_x:+.4f} m, dy={err_y:+.4f} m, dz={err_z:+.4f} m")
 
-    # Log a row (includes raw strings + split vectors)
+    # Log a row
     csv_f, csv_w = open_csv_logger(LOG_CSV_PATH, include_wrench=LOG_WRENCH, dim=DELTA_EIT_DIM)
     wrench = rtde_r.getActualTCPForce() if LOG_WRENCH else [None]*6
     row = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "session_id": datetime.now().strftime("%Y%m%d-%H%M%S"),
-        "desired_x": desired_x, "desired_y": desired_y, "desired_z": desired_z,
+        "desired_x": DESIRED_XYZ[0], "desired_y": DESIRED_XYZ[1], "desired_z": DESIRED_XYZ[2],
+        "second_target_x": second_x, "second_target_y": second_y, "second_target_z": second_z,
         "start_x": start_pose[0], "start_y": start_pose[1], "start_z": start_pose[2],
         "start_rx": start_pose[3], "start_ry": start_pose[4], "start_rz": start_pose[5],
         "contact_x": contact_pose[0], "contact_y": contact_pose[1], "contact_z": contact_pose[2],
         "pred_x": pred_x, "pred_y": pred_y, "pred_z": pred_z,
-        "goal_x": final_pose[0], "goal_y": final_pose[1], "goal_z": final_pose[2],
+        "goal_x": second_x, "goal_y": second_y, "goal_z": second_z,  # log the intended second-contact XYZ
         "final_x": final_pose[0], "final_y": final_pose[1], "final_z": final_pose[2],
         "err_x": err_x, "err_y": err_y, "err_z": err_z,
         "eit_raw_before": (eit_raw_before or ""),
@@ -649,10 +738,7 @@ def main():
         row.update({"Fx":Fx,"Fy":Fy,"Fz":Fz,"Tx":Tx,"Ty":Ty,"Tz":Tz})
     csv_w.writerow(row); csv_f.flush(); csv_f.close()
 
-    # Back to safe hover
-    safe_moveL(rtde_c, rtde_r, add_z(final_pose, HOVER_LIFT_Z), SPEED, ACCEL)
-
-    # Cleanup
+    # Stay where we stopped after the Y-scan
     try: rtde_c.stopScript()
     except Exception: pass
     try:

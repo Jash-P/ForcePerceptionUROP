@@ -9,7 +9,7 @@ UR5 + EIT with sensor_init.py-grade contact detection:
 Then:
   • Build ΔEIT[256] at contact vs hover
   • Run stage1 ensemble to infer XYZ
-  • Move by (desired - predicted): XY at hover, absolute Z to goal
+  • Move by (desired - predicted): XY at hover, then continuous lower to goal Z (EIT-guarded)
   • Report final pose error and log a row
 
 Requires: ur-rtde, pyserial, numpy, joblib
@@ -67,18 +67,27 @@ ENSEMBLE_PATH = "./outputs_stage1_tuned/eit_stage1_xyz_ensemble.joblib"
 DELTA_EIT_DIM = 256
 
 # Desired contact (base frame)
-DESIRED_XYZ = [-0.030, -0.500, 0.200]   # meters
+DESIRED_XYZ = [-0.006, -0.493, -0.222+0.350]   # meters
 
 # Initial randomization around desired XY (±range in meters)
 RAND_INIT_X_RANGE = 0.030   # ±30 mm
 RAND_INIT_Y_RANGE = 0.030   # ±30 mm
 
+# >>> Start-Z offset <<<
+# Starting Z = desired_z + START_Z_OFFSET. Positive values start above the goal.
+START_Z_OFFSET = 0.050
+
 # Orientation choice
 USE_CURRENT_ORIENT   = False
-EXPLICIT_START_POSE  = [-0.030, -0.500, 0.200, 0.50, -1.50, 0.66]  # use only [3:6]
+EXPLICIT_START_POSE  = [-0.030, -0.500, 0.200, 0.47, -1.50, 0.65]  # use only [3:6]
+
+# Continuous lower-to-endpoint (after EIT) — params
+ENDPOINT_CONT_Z_SPEED   = 0.010  # m/s downward
+ENDPOINT_CONT_CMD_DT    = 0.20   # s per segment
+ENDPOINT_CONT_STOP_RAMP = 0.20   # s decel ramp
 
 # Logging
-LOG_CSV_PATH = "eit_infer_xyz_randomstart_runlog.csv"
+LOG_CSV_PATH = "eit_infer_xyz_randomstart_runlog_functional.csv"
 LOG_WRENCH   = True
 
 # ------------------------- Robust EIT detection ------------------------ #
@@ -443,6 +452,73 @@ def descend_until_contact(rtde_c, rtde_r, hover_pose, target_pose,
     final_pose[2] = z
     return contact, final_pose
 
+# -------- Continuous lower to endpoint (EIT-guarded; stop on contact) -------- #
+
+def _sample_motion_window(eit, work_vec, detector):
+    line = eit.latest()
+    if parse_vec_into(line, work_vec) != detector.cols:
+        return None
+    v = detector.prefilter(work_vec)
+    return detector.score(v)
+
+def continuous_lower_until_contact(rtde_c, rtde_r, hover_pose, goal_pose_absZ,
+                                   eit, detector, work_vec,
+                                   z_speed=ENDPOINT_CONT_Z_SPEED,
+                                   cmd_dt=ENDPOINT_CONT_CMD_DT,
+                                   stop_ramp=ENDPOINT_CONT_STOP_RAMP):
+    """
+    speedL-based continuous descent from hover_pose to goal_pose_absZ (same x,y,rx,ry,rz).
+    Uses robust EIT scoring + debounce; stops on confirmed contact or when end_z reached.
+    Returns: (contact_detected, reached_pose)
+    """
+    # enforce same x,y,rx,ry,rz
+    for k in (0,1,3,4,5):
+        assert abs(hover_pose[k]-goal_pose_absZ[k]) < 1e-9
+
+    zmin_allowed = MIN_BASE_Z + FLOOR_MARGIN
+    end_z = max(goal_pose_absZ[2], zmin_allowed)
+
+    vz_cmd = [0.0, 0.0, -abs(z_speed), 0.0, 0.0, 0.0]
+    confirm = 0
+    contact = False
+    z_baseline = rtde_r.getActualTCPPose()[2]
+
+    try:
+        while True:
+            pose = rtde_r.getActualTCPPose()
+            znow = pose[2]
+            if znow <= end_z + 1e-6:
+                break
+
+            rtde_c.speedL(vz_cmd, ACCEL, cmd_dt)
+
+            s = _sample_motion_window(eit, work_vec, detector)
+            if s is not None:
+                dz_from_baseline = z_baseline - znow
+                if detector.can_eval(dz_from_baseline) and detector.refractory_ok():
+                    if s >= detector.confirm_eff:
+                        confirm += 1
+                    else:
+                        confirm = 0
+                    if confirm >= DEBOUNCE_CONSEC:
+                        contact = True
+                        detector.mark_confirm()
+                        print(f"[CONTACT-ENDPOINT] z={znow:.4f} score={s:.3f}")
+                        break
+
+            time.sleep(0.01)
+    finally:
+        try:
+            rtde_c.speedStop(stop_ramp)
+        except Exception:
+            pass
+        time.sleep(stop_ramp + 0.02)
+
+    reached_pose = rtde_r.getActualTCPPose()
+    if reached_pose[2] < end_z:
+        reached_pose = list(reached_pose); reached_pose[2] = end_z
+    return contact, reached_pose
+
 # --------------------------- Small helpers ----------------------------- #
 
 def auto_pick_port():
@@ -525,7 +601,7 @@ def main():
 
     start_x = desired_x + random.uniform(-RAND_INIT_X_RANGE, +RAND_INIT_X_RANGE)
     start_y = desired_y + random.uniform(-RAND_INIT_Y_RANGE, +RAND_INIT_Y_RANGE)
-    start_z = desired_z
+    start_z = desired_z + START_Z_OFFSET
     start_pose = [start_x, start_y, start_z, rx, ry, rz]
 
     # Move to hover
@@ -566,7 +642,6 @@ def main():
     vb = [0.0]*eit_cols
     va = [0.0]*eit_cols
     if parse_vec_into(eit_raw_before, vb) < eit_cols:
-        # fallback to detector baseline (robust)
         vb = list(detector.baseline)
     else:
         vb = list(vb)
@@ -586,7 +661,7 @@ def main():
     pred_x, pred_y, pred_z = map(float, pred_xyz[0])
     print(f"[PRED] xyz = {pred_x:.4f}, {pred_y:.4f}, {pred_z:.4f}")
 
-    # Move by (desired - predicted): rise, XY at hover, absolute Z
+    # Move by (desired - predicted): rise, XY at hover
     dx = desired_x - pred_x
     dy = desired_y - pred_y
     print(f"[MOVE] delta_xy = ({dx:+.4f}, {dy:+.4f}) m; target_z_abs = {desired_z:.4f} m")
@@ -604,16 +679,39 @@ def main():
         print("[MOVE] Could not move to hover over desired XY.")
         final_pose = rtde_r.getActualTCPPose()
     else:
-        goal_at_z = [
-            hover_to_goal_xy[0],
-            hover_to_goal_xy[1],
-            DESIRED_XYZ[2],  # absolute Z
-            contact_pose[3], contact_pose[4], contact_pose[5]
-        ]
-        if not safe_moveL(rtde_c, rtde_r, goal_at_z, SPEED, ACCEL):
-            print("[MOVE] Could not move to absolute desired Z.")
-        time.sleep(0.25)
-        final_pose = rtde_r.getActualTCPPose()
+        # Re-baseline at corrected hover for reliable endpoint contact-stop
+        if not detector.build_baseline(eit, timeout_s=3.0):
+            print("[EIT] Baseline (post-XY) failed; proceeding without endpoint contact gating.")
+            # Fallback: ungated lower (not recommended)
+            goal_at_z = [hover_to_goal_xy[0], hover_to_goal_xy[1], DESIRED_XYZ[2],
+                         hover_to_goal_xy[3], hover_to_goal_xy[4], hover_to_goal_xy[5]]
+            final_pose = continuous_lower_until_contact(  # still uses function; will just never trigger
+                rtde_c, rtde_r, hover_to_goal_xy, goal_at_z,
+                eit, detector, work_vec,
+                z_speed=ENDPOINT_CONT_Z_SPEED,
+                cmd_dt=ENDPOINT_CONT_CMD_DT,
+                stop_ramp=ENDPOINT_CONT_STOP_RAMP
+            )[1]
+        else:
+            detector.calibrate_hover_noise(eit, work_vec, max_time_s=2.0)
+            print(f"[THR2] WARN_EFF={detector.warn_eff:.2f}, CONFIRM_EFF={detector.confirm_eff:.2f}")
+
+            goal_at_z = [
+                hover_to_goal_xy[0],
+                hover_to_goal_xy[1],
+                DESIRED_XYZ[2],  # absolute Z
+                hover_to_goal_xy[3], hover_to_goal_xy[4], hover_to_goal_xy[5]
+            ]
+
+            # >>> EIT-guarded continuous lower to endpoint; stop on contact <<<
+            _contact2, final_pose = continuous_lower_until_contact(
+                rtde_c, rtde_r,
+                hover_to_goal_xy, goal_at_z,
+                eit, detector, work_vec,
+                z_speed=ENDPOINT_CONT_Z_SPEED,
+                cmd_dt=ENDPOINT_CONT_CMD_DT,
+                stop_ramp=ENDPOINT_CONT_STOP_RAMP
+            )
 
     # Report error
     err_x = final_pose[0] - desired_x
@@ -649,8 +747,7 @@ def main():
         row.update({"Fx":Fx,"Fy":Fy,"Fz":Fz,"Tx":Tx,"Ty":Ty,"Tz":Tz})
     csv_w.writerow(row); csv_f.flush(); csv_f.close()
 
-    # Back to safe hover
-    safe_moveL(rtde_c, rtde_r, add_z(final_pose, HOVER_LIFT_Z), SPEED, ACCEL)
+    # NOTE: No return-to-hover. We intentionally STAY at the endpoint.
 
     # Cleanup
     try: rtde_c.stopScript()

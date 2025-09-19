@@ -1,0 +1,60 @@
+{
+  "created_utc": "2025-09-18T18:35:31.686800Z",
+  "csv_path": "/home/jash/Documents/ForcePerceptionUROP/data/eit_localisation_log.csv",
+  "rows_final": 1028,
+  "test_size_groups": 0.2,
+  "grouping": "xyz",
+  "filters": {
+    "contact_only": false,
+    "min_Fz": 50.0,
+    "min_deit_pct": 12.0,
+    "winsor_pct": 99.5,
+    "per_session_norm": true
+  },
+  "cv_folds": 5,
+  "model_choice": "all",
+  "stack_top_n": 3,
+  "bag_models": 10,
+  "top_combos": [
+    {
+      "family": "ridge",
+      "params": {
+        "alpha": 300.0,
+        "pca_var": 0.0
+      },
+      "cv_score": 0.014986017531531975
+    },
+    {
+      "family": "pls",
+      "params": {
+        "n_components": 6,
+        "pca_var": 0.0
+      },
+      "cv_score": 0.015253543672191386
+    },
+    {
+      "family": "pls",
+      "params": {
+        "n_components": 8,
+        "pca_var": 0.0
+      },
+      "cv_score": 0.015253543672191386
+    }
+  ],
+  "test_metrics": {
+    "vector_rmse_m": 0.01440368568510942,
+    "vector_mae_m": 0.012308810239272088,
+    "per_axis_rmse_m": [
+      0.009386719342415632,
+      0.010314512494756482,
+      0.0036009017339631326
+    ],
+    "per_axis_mae_m": [
+      0.0069710306630106945,
+      0.008165343209508184,
+      0.0028093732853503237
+    ],
+    "vector_rmse_xy_m": 0.013946313778836593,
+    "vector_mae_xy_m": 0.011716653280011357
+  }
+}
