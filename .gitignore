@@ -1,0 +1,21 @@
+
+# macOS
+.DS_Store
+
+# large archives / generated model artifacts
+*.zip
+*.pt
+*.joblib
+*.npz
+
+# generated ML outputs
+eit_model_training/**/outputs*/
+eit_model_training/**/outputs_*/
+eit_model_training/**/outputs_quaternion*/
+eit_model_training/**/outputs_stage*/
+eit_model_training/**/outputs_krr*/
+
+# ROS build artifacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
